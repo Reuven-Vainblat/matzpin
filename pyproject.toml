@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "encryptor-daemon"
+version = "0.1.0"
+description = "Cyber-oriented Raspberry Pi/server encrypted messaging project."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=41"]
+
+[project.scripts]
+encryptor-pi = "encryptor_pi.main:main"
+encryptor-server = "encryptor_server.main:main"
+encryptor-demi-client = "encryptor_demi_client.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["encryptor_common*", "encryptor_demi_client*", "encryptor_pi*", "encryptor_server*"]
