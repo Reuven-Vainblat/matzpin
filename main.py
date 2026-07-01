@@ -13,6 +13,8 @@ def main():
 
     encryptor = Encryptor(sys.argv[1] == "server", sys.argv[2], sys.argv[3], sys.argv[4])
 
+    encryptor.connect()
+
     encryptor.sync_keys()
     
     # # Start red side thread
