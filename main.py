@@ -43,7 +43,7 @@ class Encryptor:
 
     def connect(self):
         """Establishes the connection based on the mode."""
-        if self.mode == 'server':
+        if self.is_server:
             self._setup_receiver()
         else:
             self._setup_sender()
