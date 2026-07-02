@@ -11,7 +11,7 @@ def main():
         print("Usage: python script.py [server|host] <red_nic> <black_ip> <black_port>")
         return
 
-    encryptor = Encryptor(sys.argv[1] == "server", sys.argv[2], sys.argv[3], sys.argv[4])
+    encryptor = Encryptor(sys.argv[1] == "server", sys.argv[2], sys.argv[3], int(sys.argv[4]))
 
     encryptor.connect()
 
