@@ -17,11 +17,12 @@ def main():
 
     encryptor.sync_keys()
     
-    # # Start red side thread
-    # red_thread = threading.Thread(target=red_side_loop, args=(red_socket))
+    # Start red side thread
+    red_thread = threading.Thread(target=encryptor.red_to_black_loop)
 
-    # # Start black side thread
-    # black_thread = threading.Thread(target=black_side_loop, args=(black_socket))
+    # Start black side thread
+    black_thread = threading.Thread(target=encryptor.black_to_red_loop)
+    
 
 class Encryptor:
     def __init__(self, is_server, red_nic, black_ip, black_port=9999):
@@ -56,7 +57,7 @@ class Encryptor:
         
         self.server_socket.bind((self.black_ip, self.black_port))
         self.server_socket.listen(1)
-        print(f"[Receiver] Listening on {self.host}:{self.port}...")
+        print(f"[Receiver] Listening on {self.black_ip}:{self.black_port}...")
         
         # Block and wait for incoming connection
         self.black_connection, address = self.server_socket.accept()
@@ -65,7 +66,7 @@ class Encryptor:
     def _setup_sender(self):
         # Create a TCP/IP socket
         self.black_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        print(f"[Sender] Connecting to {self.host}:{self.port}...")
+        print(f"[Sender] Connecting to {self.black_ip}:{self.black_port}...")
         
         # Attempt to connect to the receiver
         self.black_connection.connect((self.black_ip, self.black_port))
