@@ -1,10 +1,10 @@
-from red_side import red_side_loop
-from black_side import black_side_loop
+import red_side, black_side
 
 import socket
 import struct
 import threading, sys
 
+ETH_P_ALL = 3 #read all protocols
 
 def main():
     if len(sys.argv) < 5 or (sys.argv[1] not in ("server", "host")):
@@ -33,10 +33,13 @@ class Encryptor:
         self.server_socket = None
         self.black_connection = None
 
-        self.red_socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        self.red_socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
         self.red_socket.bind((red_nic,0))
 
         self.key = ""
+
+        self.active = True
+
 
     def connect(self):
         """Establishes the connection based on the mode."""
@@ -72,3 +75,42 @@ class Encryptor:
         #TODO
         pass
 
+
+    def black_to_red_loop(self):
+        """
+        We dont trust the black side
+        Get full TCP message
+        [:8] is the Hash [9:] is ENC(PKT)
+        Verify [:8]==hash(ENC(PKT)+key)
+        Decrypt the paket
+        Send it over black connection
+        """
+        
+        while True:
+            packet_recived = black_side.receive_tcp_message(self.black_connection)
+            ## NEED VERIFY AND DECYPTION LOGIC
+            self.red_socket.send(packet_recived)
+    
+    def red_to_black_loop(self):
+        """
+        We trust the red side
+        Take the packet and encrypt it
+        Create a verify Hash
+        Send over the black connection HASH(ENC(PKT)+key) + ENC(PKT)
+        """
+
+        packet_data, address = self.red_socket.recvfrom(65535)
+        print(f"\n--- New Packet Received ---")
+        print(f"From Address Info: {address}")
+        print(f"Raw Byte Length: {len(packet_data)}")
+        print(f"Hex Payload Hash: {packet_data[64].hex()}")
+
+        #Verify and decrypt
+
+        self.black_connection.send(packet_data)
+
+
+
+if __name__ == "__main__":
+    print("Starting Encryptor")
+    main()
