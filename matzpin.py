@@ -68,6 +68,9 @@ class Encryptor:
         
         while self.active:
             packet_recived = black_side.receive_tcp_message(self.black_connection)
+            if packet_recived is None:
+                print("Received None. Connection likely dropped or invalid data received.")
+                continue
             print("Got Black Message, Forwarding Packet")
             ## NEED VERIFY AND DECYPTION LOGIC
             self.red_socket.send(packet_recived)
