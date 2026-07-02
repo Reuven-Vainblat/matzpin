@@ -31,7 +31,7 @@ def receive_tcp_message(sock):
 
         # 3. Read the actual payload based on the size received
         message_payload = receive_exact_bytes(sock, message_length)
-        return message_payload.decode("utf-8")
+        return message_payload
         
     except ConnectionError as e:
         print(f"Network error: {e}")
