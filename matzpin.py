@@ -84,7 +84,7 @@ class Encryptor:
             print(f"\n--- New Packet Received On Red Side ---")
             print(f"From Address Info: {address}")
             print(f"Raw Byte Length: {len(packet_data)}")
-            print(f"Hex Payload Hash: {packet_data[64].hex()}")
+            print(f"Hex Payload Hash: {packet_data[:64].hex()}")
 
             #Verify and decrypt
 
