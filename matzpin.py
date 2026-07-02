@@ -72,6 +72,9 @@ class Encryptor:
                 print("Received None. Connection likely dropped or invalid data received.")
                 continue
             print("Got Black Message, Forwarding Packet")
+            if len(packet_recived > 1500):
+                print("packet too long")
+                continue
             ## NEED VERIFY AND DECYPTION LOGIC
             self.red_socket.send(packet_recived)
     
