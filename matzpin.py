@@ -91,5 +91,5 @@ class Encryptor:
 
             #Verify and decrypt
 
-            self.black_connection.send(packet_data)
+            self.black_connection.send(len(packet_data).to_bytes(4, byteorder="big")+packet_data)
 
