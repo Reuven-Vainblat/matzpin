@@ -1,4 +1,7 @@
 
+def send_tcp_data(sock, data):
+    sock.send(len(data).to_bytes(4, byteorder="big")+data)
+
 def receive_exact_bytes(sock, num_bytes):
     """Ensures exactly the requested number of bytes are read from the stream."""
     buffer = b""
@@ -12,7 +15,7 @@ def receive_exact_bytes(sock, num_bytes):
 def receive_tcp_message(sock):
     """Receives a complete message prefixed with a 4-byte length header."""
     # Define a reasonable maximum size for your payloads (e.g., 10 MB)
-    MAX_PAYLOAD_SIZE = 10 * 1024 * 1024 
+    MAX_PACKET_SIZE = 9000 
 
     try:
         # 1. Read the 4-byte integer header to find out the payload size
@@ -24,8 +27,8 @@ def receive_tcp_message(sock):
         print(f"[DEBUG] Parsed message length: {message_length} bytes (Header raw: {header})")
 
         # 2. Sanity check the size before receiving the payload
-        if message_length > MAX_PAYLOAD_SIZE:
-            raise ValueError(f"Message length {message_length} exceeds max allowed size of {MAX_PAYLOAD_SIZE}. Sender might be using the wrong protocol.")
+        if message_length > MAX_PACKET_SIZE:
+            raise ValueError(f"Message length {message_length} exceeds max allowed size of {MAX_PACKET_SIZE}. Sender might be using the wrong protocol.")
         if message_length < 0:
             raise ValueError(f"Invalid message length: {message_length}")
 
