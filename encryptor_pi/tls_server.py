@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import socket
 import ssl
 
@@ -9,6 +10,8 @@ from encryptor_common.framing import recv_framed_message, send_framed_message
 
 from .config import PiConfig
 from .processor import handle_message
+
+LOGGER = logging.getLogger(__name__)
 
 
 def create_ssl_context(config: PiConfig) -> ssl.SSLContext:
@@ -27,10 +30,15 @@ def run_server(config: PiConfig) -> None:
     context = create_ssl_context(config)
     with socket.create_server((config.host, config.port), reuse_port=False) as server_sock:
         while True:
-            client_sock, _ = server_sock.accept()
+            client_sock, address = server_sock.accept()
             with client_sock:
-                with context.wrap_socket(client_sock, server_side=True) as tls_sock:
-                    handle_connection(tls_sock, config)
+                client_sock.settimeout(config.request_timeout_seconds)
+                try:
+                    with context.wrap_socket(client_sock, server_side=True) as tls_sock:
+                        tls_sock.settimeout(config.request_timeout_seconds)
+                        handle_connection(tls_sock, config)
+                except Exception as exc:
+                    LOGGER.warning("Rejected Pi client connection from %s: %s", address, exc)
 
 
 def handle_connection(tls_sock: ssl.SSLSocket, config: PiConfig) -> None:

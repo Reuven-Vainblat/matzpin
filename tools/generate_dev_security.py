@@ -329,6 +329,7 @@ def build_pi_config(
         "replay_db_path": str(replay_db_path),
         "max_message_size": MAX_MESSAGE_SIZE,
         "max_clock_skew_seconds": 300,
+        "request_timeout_seconds": 5,
         "forward_host": forward_host,
         "forward_port": forward_port,
         "forward_timeout_seconds": 5,

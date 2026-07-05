@@ -29,6 +29,7 @@ class PiConfig:
     replay_db_path: str
     max_message_size: int
     max_clock_skew_seconds: int
+    request_timeout_seconds: float
     forward_host: str
     forward_port: int
     forward_timeout_seconds: float
@@ -63,6 +64,7 @@ def load_config(path: str | None = None) -> PiConfig:
         replay_db_path=_get(data, "replay_db_path", "PI_REPLAY_DB", "pi/replay.sqlite3"),
         max_message_size=int(_get(data, "max_message_size", "PI_MAX_MESSAGE_SIZE", 1_048_576)),
         max_clock_skew_seconds=int(_get(data, "max_clock_skew_seconds", "PI_MAX_CLOCK_SKEW", 300)),
+        request_timeout_seconds=float(_get(data, "request_timeout_seconds", "PI_REQUEST_TIMEOUT", 10.0)),
         forward_host=_get(data, "forward_host", "PI_FORWARD_HOST", "127.0.0.1"),
         forward_port=int(_get(data, "forward_port", "PI_FORWARD_PORT", 9443)),
         forward_timeout_seconds=float(_get(data, "forward_timeout_seconds", "PI_FORWARD_TIMEOUT", 10.0)),
@@ -73,4 +75,3 @@ def _get(data: dict[str, Any], key: str, env_name: str, default: Any) -> Any:
     """Return an environment override, JSON value, or default in that order."""
 
     return os.getenv(env_name, data.get(key, default))
-

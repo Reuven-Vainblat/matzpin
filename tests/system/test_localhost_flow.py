@@ -99,6 +99,7 @@ class LocalhostSystemTest(unittest.TestCase):
 
                 self.assertNotEqual(server.returncode, 0)
                 self.assertFalse(received_output.exists())
+                _assert_process_running(pi, "Pi")
             finally:
                 _stop_process(pi)
                 _stop_process(client)
@@ -130,6 +131,7 @@ class LocalhostSystemTest(unittest.TestCase):
 
                 self.assertNotEqual(server.returncode, 0)
                 self.assertFalse(received_output.exists())
+                _assert_process_running(pi, "Pi")
             finally:
                 _stop_process(pi)
                 _stop_process(client)
@@ -161,6 +163,7 @@ class LocalhostSystemTest(unittest.TestCase):
 
                 self.assertNotEqual(server.returncode, 0)
                 self.assertFalse(received_output.exists())
+                _assert_process_running(pi, "Pi")
             finally:
                 _stop_process(pi)
                 _stop_process(client)
@@ -230,6 +233,14 @@ def _wait_for_process(started: StartedProcess, timeout: float = 5.0) -> int:
         started.process.kill()
         started.process.communicate(timeout=5)
     return started.process.returncode
+
+
+def _assert_process_running(started: StartedProcess, name: str) -> None:
+    """Fail the test if a rejected request killed a long-running daemon."""
+
+    if started.process.poll() is not None:
+        _, stderr = _drain_process_output(started)
+        raise AssertionError(f"{name} exited unexpectedly\n{stderr}")
 
 
 def _stop_process(started: StartedProcess) -> None:

@@ -7,8 +7,14 @@ __pycache__/
 .codex/
 
 dev_runtime/
+authority-dev/
+pi-runtime/
+server-runtime/
 tmp-security-smoke-*/
 tmp-separate-security-*/
+server_k1.pem
+received-from-pi.txt
+*.sqlite3
 
 .pytest_cache/
 .mypy_cache/
