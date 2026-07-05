@@ -12,13 +12,20 @@ import time
 import unittest
 from pathlib import Path
 
+from cryptography import x509
+
 from tools.generate_dev_security import (
     build_demi_client_config,
     build_pi_config,
     build_server_config,
+    generate_dev_authority,
     generate_dev_security,
+    generate_pi_security,
+    generate_server_security,
     write_config_file,
+    write_default_configs,
 )
+from encryptor_pi.replay_db import init_replay_db
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +45,69 @@ class SecurityRoots:
 
 
 class LocalhostSystemTest(unittest.TestCase):
+    def test_replay_db_initialization_creates_parent_directories(self) -> None:
+        """Replay storage should be created even when its parent path is absent."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            replay_db = Path(temp_dir) / "missing" / "nested" / "replay.sqlite3"
+
+            init_replay_db(str(replay_db))
+
+            self.assertTrue(replay_db.is_file())
+
+    def test_generation_writes_real_pi_ip_into_cert_and_configs(self) -> None:
+        """Generated real-machine material should not require DNS or hand edits."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            pi_ip = "172.201.0.11"
+            ca_key, ca_cert = generate_dev_authority(workspace)
+            generate_pi_security(workspace, ca_key, ca_cert, pi_ip_addresses=[pi_ip])
+            generate_server_security(workspace, ca_key, ca_cert)
+            configs = write_default_configs(
+                root=workspace,
+                component="all",
+                server_port=0,
+                pi_port=18443,
+                client_port=19443,
+                pi_listen_host="0.0.0.0",
+                pi_connect_host=pi_ip,
+            )
+
+            pi_config = configs["pi"].read_text(encoding="utf-8")
+            server_config = configs["server"].read_text(encoding="utf-8")
+            ca_cert = x509.load_pem_x509_certificate((workspace / "authority" / "ca.crt").read_bytes())
+            pi_cert = x509.load_pem_x509_certificate((workspace / "pi" / "certs" / "pi.crt").read_bytes())
+            san = pi_cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+
+            self.assertIn('"host": "0.0.0.0"', pi_config)
+            self.assertIn(f'"pi_host": "{pi_ip}"', server_config)
+            self.assertIn('"pi_x25519_public_key_path": "', server_config)
+            self.assertNotIn("\\\\", server_config)
+            self.assertIn(pi_ip, [str(address) for address in san.get_values_for_type(x509.IPAddress)])
+            ca_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+            ca_cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+            pi_cert.extensions.get_extension_for_class(x509.SubjectKeyIdentifier)
+            pi_cert.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+
+    def test_pi_component_writes_demi_client_config(self) -> None:
+        """Pi-side generation should include the local downstream client config."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+
+            configs = write_default_configs(
+                root=workspace,
+                component="pi",
+                server_port=0,
+                pi_port=18443,
+                client_port=19443,
+            )
+
+            self.assertIn("pi", configs)
+            self.assertIn("client", configs)
+            self.assertTrue((workspace / "config" / "client.local.json").is_file())
+
     def test_pi_main_then_server_main_round_trip_on_distinct_ports(self) -> None:
         message = "system test payload from the real client"
         downstream_response = "downstream client received payload"
@@ -319,6 +389,7 @@ def _prepare_test_configs(
             trust_root=trust_root,
             signing_key_root=signing_key_root,
             encryption_key_root=encryption_key_root,
+            local_host="127.0.0.1",
         ),
     )
     write_config_file(

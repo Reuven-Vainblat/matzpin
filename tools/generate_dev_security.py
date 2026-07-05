@@ -53,10 +53,36 @@ def main() -> None:
     parser.add_argument("--key-id", default=_env("SECURITY_KEY_ID", "k1"))
     parser.add_argument("--pi-hostname", default=_env("SECURITY_PI_HOSTNAME", "raspberry-pi"))
     parser.add_argument("--server-hostname", default=_env("SECURITY_SERVER_HOSTNAME", "server"))
+    parser.add_argument(
+        "--pi-ip",
+        action="append",
+        default=_split_csv(_env("SECURITY_PI_IPS", "")),
+        help="IP address to add to the Pi TLS certificate SAN. Can be repeated.",
+    )
+    parser.add_argument(
+        "--server-ip",
+        action="append",
+        default=_split_csv(_env("SECURITY_SERVER_IPS", "")),
+        help="IP address to add to the server TLS certificate SAN. Can be repeated.",
+    )
+    parser.add_argument(
+        "--pi-listen-host",
+        default=_env("SECURITY_PI_LISTEN_HOST", ""),
+        help="Host/IP for the generated Pi config to bind. Defaults to 0.0.0.0 when --pi-ip is set, otherwise 127.0.0.1.",
+    )
+    parser.add_argument(
+        "--pi-connect-host",
+        default=_env("SECURITY_PI_CONNECT_HOST", ""),
+        help="Host/IP for the generated server config to connect to. Defaults to the first --pi-ip, otherwise 127.0.0.1.",
+    )
     args = parser.parse_args()
 
     root = Path(args.out)
     authority_root = Path(args.authority_root) if args.authority_root else root
+    pi_ips = _unique_values(args.pi_ip)
+    server_ips = _unique_values(args.server_ip)
+    pi_listen_host = args.pi_listen_host or ("0.0.0.0" if pi_ips else "127.0.0.1")
+    pi_connect_host = args.pi_connect_host or (pi_ips[0] if pi_ips else "127.0.0.1")
     if args.component == "authority":
         generate_dev_authority(root)
     elif args.component == "pi":
@@ -68,6 +94,7 @@ def main() -> None:
             sender_id=args.sender_id,
             key_id=args.key_id,
             pi_hostname=args.pi_hostname,
+            pi_ip_addresses=pi_ips,
             trusted_server_public_key=Path(args.server_public_key) if args.server_public_key else None,
         )
     elif args.component == "server":
@@ -79,6 +106,7 @@ def main() -> None:
             sender_id=args.sender_id,
             key_id=args.key_id,
             server_hostname=args.server_hostname,
+            server_ip_addresses=server_ips,
             pi_public_key=Path(args.pi_public_key) if args.pi_public_key else None,
         )
     elif args.component == "trust-server":
@@ -96,6 +124,8 @@ def main() -> None:
             key_id=args.key_id,
             pi_hostname=args.pi_hostname,
             server_hostname=args.server_hostname,
+            pi_ip_addresses=pi_ips,
+            server_ip_addresses=server_ips,
         )
 
     if not args.no_config and args.component in ("all", "pi", "server"):
@@ -105,6 +135,8 @@ def main() -> None:
             server_port=args.server_port,
             pi_port=args.pi_port,
             client_port=args.client_port,
+            pi_listen_host=pi_listen_host,
+            pi_connect_host=pi_connect_host,
         )
 
     print(f"Wrote development security files under {root.resolve()}")
@@ -120,6 +152,8 @@ def generate_dev_security(
     key_id: str = "k1",
     pi_hostname: str = "raspberry-pi",
     server_hostname: str = "server",
+    pi_ip_addresses: list[str] | None = None,
+    server_ip_addresses: list[str] | None = None,
 ) -> None:
     """Generate all development certificates, keys, and peer key copies."""
 
@@ -131,6 +165,7 @@ def generate_dev_security(
         sender_id=sender_id,
         key_id=key_id,
         pi_hostname=pi_hostname,
+        pi_ip_addresses=pi_ip_addresses,
     )
     generate_server_security(
         root=root,
@@ -139,6 +174,7 @@ def generate_dev_security(
         sender_id=sender_id,
         key_id=key_id,
         server_hostname=server_hostname,
+        server_ip_addresses=server_ip_addresses,
     )
     install_server_public_key_on_pi(root, root, sender_id, key_id)
     install_pi_public_key_on_server(root, root)
@@ -175,6 +211,7 @@ def generate_pi_security(
     sender_id: str = "server",
     key_id: str = "k1",
     pi_hostname: str = "raspberry-pi",
+    pi_ip_addresses: list[str] | None = None,
     trusted_server_public_key: Path | None = None,
 ) -> None:
     """Generate Pi-side TLS and message-decryption material."""
@@ -194,7 +231,7 @@ def generate_pi_security(
         leaf_key=pi_key,
         common_name=pi_hostname,
         dns_names=[pi_hostname, "localhost"],
-        ip_addresses=["127.0.0.1"],
+        ip_addresses=_with_loopback(pi_ip_addresses),
         usages=[ExtendedKeyUsageOID.SERVER_AUTH],
     )
     _write_private_key(pi_certs_dir / "pi.key", pi_key)
@@ -227,6 +264,7 @@ def generate_server_security(
     sender_id: str = "server",
     key_id: str = "k1",
     server_hostname: str = "server",
+    server_ip_addresses: list[str] | None = None,
     pi_public_key: Path | None = None,
 ) -> None:
     """Generate server-side TLS and message-signing material."""
@@ -246,7 +284,7 @@ def generate_server_security(
         leaf_key=server_tls_key,
         common_name=server_hostname,
         dns_names=[server_hostname, "localhost"],
-        ip_addresses=["127.0.0.1"],
+        ip_addresses=_with_loopback(server_ip_addresses),
         usages=[ExtendedKeyUsageOID.CLIENT_AUTH, ExtendedKeyUsageOID.SERVER_AUTH],
     )
     _write_private_key(server_private_keys_dir / "server_tls.key", server_tls_key)
@@ -326,7 +364,7 @@ def build_pi_config(
         "expected_recipient_id": "raspberry-pi",
         "sender_public_keys_dir": _security_path(security_root, "pi", "keys", "senders"),
         "x25519_private_key_path": _security_path(security_root, "pi", "keys", "private", "pi_x25519.pem"),
-        "replay_db_path": str(replay_db_path),
+        "replay_db_path": _portable_path(replay_db_path),
         "max_message_size": MAX_MESSAGE_SIZE,
         "max_clock_skew_seconds": 300,
         "request_timeout_seconds": 5,
@@ -344,7 +382,7 @@ def build_server_config(
     signing_key_root: Path | None = None,
     encryption_key_root: Path | None = None,
     pi_host: str = "127.0.0.1",
-    local_host: str = "127.0.0.1",
+    local_host: str | None = None,
 ) -> dict[str, object]:
     """Build a server config from generated development security files.
 
@@ -389,7 +427,7 @@ def build_demi_client_config(
         "tls_cert_path": _security_path(security_root, "pi", "certs", "pi.crt"),
         "tls_key_path": _security_path(security_root, "pi", "certs", "pi.key"),
         "response": response,
-        "received_output_path": str(received_output_path),
+        "received_output_path": _portable_path(received_output_path),
         "max_message_size": MAX_MESSAGE_SIZE,
     }
 
@@ -410,6 +448,8 @@ def write_default_configs(
     server_port: int,
     pi_port: int,
     client_port: int,
+    pi_listen_host: str = "127.0.0.1",
+    pi_connect_host: str = "127.0.0.1",
 ) -> dict[str, Path]:
     """Write local JSON configs for generated development material."""
 
@@ -420,7 +460,13 @@ def write_default_configs(
         path = config_dir / "pi.local.json"
         write_config_file(
             path,
-            build_pi_config(root, port=pi_port, forward_port=client_port, replay_db_path=root / "pi" / "replay.sqlite3"),
+            build_pi_config(
+                root,
+                port=pi_port,
+                forward_port=client_port,
+                replay_db_path=root / "pi" / "replay.sqlite3",
+                host=pi_listen_host,
+            ),
         )
         written["pi"] = path
 
@@ -428,11 +474,11 @@ def write_default_configs(
         path = config_dir / "server.local.json"
         write_config_file(
             path,
-            build_server_config(root, port=server_port, pi_port=pi_port),
+            build_server_config(root, port=server_port, pi_port=pi_port, pi_host=pi_connect_host),
         )
         written["server"] = path
 
-    if component == "all":
+    if component in ("all", "pi"):
         path = config_dir / "client.local.json"
         write_config_file(
             path,
@@ -449,13 +495,42 @@ def write_default_configs(
 
 
 def _security_path(root: Path, *parts: str) -> str:
-    return str(root.joinpath(*parts))
+    return _portable_path(root.joinpath(*parts))
+
+
+def _portable_path(path: Path) -> str:
+    """Return a config path that works on Windows and POSIX runtimes."""
+
+    return path.as_posix()
 
 
 def _env(name: str, default: str) -> str:
     """Return a non-empty environment variable value or a default."""
 
     return os.getenv(name) or default
+
+
+def _split_csv(value: str) -> list[str]:
+    """Split a comma-separated environment value into non-empty strings."""
+
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _unique_values(values: list[str] | None) -> list[str]:
+    """Return unique non-empty values while preserving order."""
+
+    unique: list[str] = []
+    for value in values or []:
+        value = value.strip()
+        if value and value not in unique:
+            unique.append(value)
+    return unique
+
+
+def _with_loopback(ip_addresses: list[str] | None) -> list[str]:
+    """Always keep localhost cert support while adding real deployment IPs."""
+
+    return _unique_values(["127.0.0.1", *(ip_addresses or [])])
 
 
 def _build_ca_cert(ca_key: rsa.RSAPrivateKey) -> x509.Certificate:
@@ -482,6 +557,11 @@ def _build_ca_cert(ca_key: rsa.RSAPrivateKey) -> x509.Certificate:
         .not_valid_after(now + timedelta(days=365))
         .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
         .add_extension(x509.KeyUsage(True, False, False, False, False, True, True, False, False), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
         .sign(ca_key, hashes.SHA256())
     )
 
@@ -527,6 +607,11 @@ def _build_leaf_cert(
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(x509.SubjectAlternativeName(san), critical=False)
         .add_extension(x509.ExtendedKeyUsage(usages), critical=False)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()), critical=False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
         .sign(ca_key, hashes.SHA256())
     )
 

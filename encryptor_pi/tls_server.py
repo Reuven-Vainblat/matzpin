@@ -29,13 +29,16 @@ def run_server(config: PiConfig) -> None:
 
     context = create_ssl_context(config)
     with socket.create_server((config.host, config.port), reuse_port=False) as server_sock:
+        LOGGER.info("Pi daemon listening on %s:%s", config.host, config.port)
         while True:
             client_sock, address = server_sock.accept()
             with client_sock:
                 client_sock.settimeout(config.request_timeout_seconds)
                 try:
+                    LOGGER.info("Pi accepted TCP connection from %s", address)
                     with context.wrap_socket(client_sock, server_side=True) as tls_sock:
                         tls_sock.settimeout(config.request_timeout_seconds)
+                        LOGGER.info("Pi completed mutual TLS with %s", address)
                         handle_connection(tls_sock, config)
                 except Exception as exc:
                     LOGGER.warning("Rejected Pi client connection from %s: %s", address, exc)
@@ -45,5 +48,7 @@ def handle_connection(tls_sock: ssl.SSLSocket, config: PiConfig) -> None:
     """Read one framed envelope, process it, and write one framed response."""
 
     request = recv_framed_message(tls_sock, config.max_message_size)
+    LOGGER.info("Pi received encrypted request: %s bytes", len(request))
     response = handle_message(request, config)
     send_framed_message(tls_sock, response)
+    LOGGER.info("Pi sent response to server: %s bytes", len(response))

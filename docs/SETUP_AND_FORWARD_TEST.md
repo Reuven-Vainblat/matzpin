@@ -13,6 +13,40 @@ service on the Pi machine.
 
 ## Generate Separate Runtime Material
 
+To regenerate the full real-machine test material in one command, run this on
+the Pi/PC machine and pass the IP that the server VM uses to reach it:
+
+```powershell
+.\tools\setup_real_test.ps1 -PiIp <PI_OR_PC_VPN_IP> -Clean
+```
+
+If you can SSH/SCP to the remote server VM, the script can also copy the
+generated server runtime folder there:
+
+```powershell
+.\tools\setup_real_test.ps1 `
+  -PiIp <PI_OR_PC_VPN_IP> `
+  -ServerSshTarget <USER>@<SERVER_VM_IP> `
+  -ServerRemotePath "~/matzpin" `
+  -Clean
+```
+
+This creates:
+
+```text
+authority-dev/
+pi-runtime/
+server-runtime/
+```
+
+It also installs the server signing public key into the Pi runtime and writes
+configs with the Pi certificate/config already using `<PI_OR_PC_VPN_IP>`. When
+`-ServerSshTarget` is provided, it copies `server-runtime/` to the remote VM.
+Set `-ServerRemotePath` to the project root on the VM, because the server still
+needs the checked-out code and its virtual environment.
+
+Manual commands are shown below for reference.
+
 Generate the authority once:
 
 ```powershell
@@ -25,7 +59,8 @@ Generate Pi runtime material:
 python tools/generate_dev_security.py `
   --component pi `
   --out pi-runtime `
-  --authority-root authority-dev
+  --authority-root authority-dev `
+  --pi-ip <PI_OR_PC_VPN_IP>
 ```
 
 Send this public key to the server:
@@ -41,7 +76,8 @@ python tools/generate_dev_security.py `
   --component server `
   --out server-runtime `
   --authority-root authority-dev `
-  --pi-public-key pi-runtime/exchange/pi_x25519.pub
+  --pi-public-key pi-runtime/exchange/pi_x25519.pub `
+  --pi-ip <PI_OR_PC_VPN_IP>
 ```
 
 Send this public key to the Pi:
@@ -96,17 +132,25 @@ The Pi daemon keeps running and waits for the server connection.
 
 ## Run The Server
 
-Before running the server, edit `server-runtime/config/server.local.json` so
-`pi_host` points to the real Pi IP address or DNS name:
+When you pass `--pi-ip`, the generated Pi certificate includes that IP address
+as a TLS Subject Alternative Name and `server-runtime/config/server.local.json`
+uses that IP as `pi_host` from the start:
 
 ```json
-"pi_host": "<PI_IP_OR_DNS>",
+"pi_host": "<PI_OR_PC_VPN_IP>",
 "pi_port": 18443
+```
+
+The generated Pi config also binds to all interfaces:
+
+```json
+"host": "0.0.0.0"
 ```
 
 Then run:
 
 ```powershell
+source .venv/bin/activate
 python -m encryptor_server.main "hello from real server" --config server-runtime/config/server.local.json
 ```
 

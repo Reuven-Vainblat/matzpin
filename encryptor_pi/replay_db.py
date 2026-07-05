@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from pathlib import Path
 import sqlite3
 import time
 
@@ -11,6 +12,10 @@ from encryptor_common.protocol import MessageEnvelope
 
 def init_replay_db(db_path: str) -> None:
     """Create the replay table if it does not already exist."""
+
+    db_parent = Path(db_path).expanduser().parent
+    if str(db_parent) not in ("", "."):
+        db_parent.mkdir(parents=True, exist_ok=True)
 
     with closing(sqlite3.connect(db_path)) as conn:
         with conn:
