@@ -1,7 +1,28 @@
 import socket
 import black_side, red_side
+import secrets
+import hashlib
 
 ETH_P_ALL = 3 #read all protocols
+
+# Base (Generator)
+DH_BASE = 2
+
+# Prime Modulus (p)
+DH_PRIME = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+    "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+    "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+    "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+    "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+    "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 
+    16
+)
 
 class Encryptor:
     def __init__(self, is_server, red_nic, black_ip, black_port=9999):
@@ -52,8 +73,32 @@ class Encryptor:
         print("[Sender] Connected successfully.")
     
     def sync_keys(self):
-        #TODO
-        pass
+        print("[KeySync] Starting Diffie-Hellman Key Exchange...")
+
+        private_key = secrets.randbits(256)
+
+        # pow(base, exponent, modulus)* 
+        public_key = pow(DH_BASE, private_key, DH_PRIME)
+        pub_bytes = public_key.to_bytes(256, byteorder="big")
+        
+        if self.is_server:
+            self.black_connection.sendall(pub_bytes)
+            peer_pub_bytes = black_side.receive_exact_bytes(self.black_connection, 256)
+        else:
+            peer_pub_bytes = black_side.receive_exact_bytes(self.black_connection, 256)
+            self.black_connection.sendall(pub_bytes)
+            
+        peer_public_key = int.from_bytes(peer_pub_bytes, byteorder="big")
+        
+        # calculate the shared secret (g^ab mod p)
+        shared_secret = pow(peer_public_key, private_key, DH_PRIME)
+        
+        shared_secret_bytes = shared_secret.to_bytes(256, byteorder="big")
+
+        # using sha256 to create a equalized key for encryption
+        self.key = hashlib.sha256(shared_secret_bytes).digest()
+        
+        print(f"[KeySync] Key exchange successful. Derived Key (Hex): {self.key.hex()}")
 
 
     def black_to_red_loop(self):
