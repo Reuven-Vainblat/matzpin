@@ -53,75 +53,8 @@ def allocate_port(src_ip, src_port):
     return NAT_TABLE[(src_ip, src_port)]['port']
 
 
-def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
-    # Require at least the minimum IPv4 header length
-    if len(packet_bytes) < 20:
-        return packet_bytes
-
-    # Parse IP Version and Header Length
-    ver_ihl = packet_bytes[0]
-    version = ver_ihl >> 4
-    if version != 4:  # Drop if not IPv4
-        return packet_bytes
-    
-    ihl = (ver_ihl & 0x0F) * 4
-    if len(packet_bytes) < ihl:
-        return packet_bytes
-
-    # Protocol check (6 = TCP, 17 = UDP)
-    protocol = packet_bytes[9]
-    if protocol not in (6, 17):
-        return packet_bytes
-
-    # Ensure Layer 4 header is present (8 bytes min for both TCP/UDP)
-    l4_offset = ihl
-    if len(packet_bytes) < l4_offset + 8:
-        return packet_bytes
-
-    # Extract IPs
-    src_ip_bytes = packet_bytes[12:16]
-    dst_ip_bytes = packet_bytes[16:20]
-    src_ip = socket.inet_ntoa(src_ip_bytes)
-    dst_ip = socket.inet_ntoa(dst_ip_bytes)
-
-    # Extract Ports
-    src_port, dst_port = struct.unpack("!HH", packet_bytes[l4_offset:l4_offset+4])
-
-    # Convert to mutable bytearray to modify the packet
-    pkt = bytearray(packet_bytes)
-
-    # Apply NAT Logic based on exactly how your scapy script behaved
-    if src_ip.startswith("192.168."):
-        # --- OUTBOUND ---
-        new_src_port = allocate_port(src_ip, src_port)
-        pkt[12:16] = socket.inet_aton(EXTERNAL_IP)
-        struct.pack_into("!H", pkt, l4_offset, new_src_port)
-        
-    elif dst_ip == EXTERNAL_IP:
-        # --- INBOUND ---
-        cleanup_expired()
-        if dst_port in REVERSE_TABLE:
-            (internal_ip, internal_port), _ = REVERSE_TABLE[dst_port]
-            
-            REVERSE_TABLE[dst_port] = ((internal_ip, internal_port), time.time())
-            NAT_TABLE[(internal_ip, internal_port)]['last_seen'] = time.time()
-            
-            pkt[16:20] = socket.inet_aton(internal_ip)
-            struct.pack_into("!H", pkt, l4_offset + 2, internal_port)
-        else:
-            return None  # Drop packet
-            
-    else:
-        # --- FALLBACK (matching your final `else` condition) ---
-        new_src_port = allocate_port(src_ip, src_port)
-        pkt[12:16] = socket.inet_aton(EXTERNAL_IP)
-        struct.pack_into("!H", pkt, l4_offset, new_src_port)
-
-
-    # ==========================
-    # CHECKSUM RECALCULATION
-    # ==========================
-    
+def _recalculate_checksums(pkt, ihl, protocol, l4_offset):
+    """Recalculate IP and L4 checksums after NAT modifications."""
     # 1. IP Checksum
     pkt[10:12] = b'\x00\x00'  # Zero out old checksum
     ip_header = pkt[0:ihl]
@@ -149,4 +82,114 @@ def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
 
     struct.pack_into("!H", pkt, csum_offset, l4_checksum)
 
+
+def _parse_ip_l4(ip_bytes):
+    """Parse IP header fields needed for NAT.
+    
+    Returns (version, ihl, protocol, l4_offset, src_ip, dst_ip, src_port, dst_port)
+    or None if the packet cannot be NATted (non-IPv4, non-TCP/UDP, too short).
+    """
+    if len(ip_bytes) < 20:
+        return None
+
+    ver_ihl = ip_bytes[0]
+    version = ver_ihl >> 4
+    if version != 4:
+        return None
+
+    ihl = (ver_ihl & 0x0F) * 4
+    if len(ip_bytes) < ihl:
+        return None
+
+    protocol = ip_bytes[9]
+    if protocol not in (6, 17):  # TCP or UDP only
+        return None
+
+    l4_offset = ihl
+    if len(ip_bytes) < l4_offset + 8:
+        return None
+
+    src_ip = socket.inet_ntoa(ip_bytes[12:16])
+    dst_ip = socket.inet_ntoa(ip_bytes[16:20])
+    src_port, dst_port = struct.unpack("!HH", ip_bytes[l4_offset:l4_offset+4])
+
+    return version, ihl, protocol, l4_offset, src_ip, dst_ip, src_port, dst_port
+
+
+def nat_outbound(ip_bytes: bytes) -> bytes:
+    """Outbound NAT: rewrite source IP/port for packets leaving the red network.
+    
+    Replaces the internal source IP with EXTERNAL_IP and assigns a mapped port.
+    Non-TCP/UDP packets are passed through unchanged.
+    """
+    parsed = _parse_ip_l4(ip_bytes)
+    if parsed is None:
+        return ip_bytes  # Pass through non-NATtable packets
+
+    version, ihl, protocol, l4_offset, src_ip, dst_ip, src_port, dst_port = parsed
+    print(f"[NAT OUT] {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
+
+    pkt = bytearray(ip_bytes)
+
+    new_src_port = allocate_port(src_ip, src_port)
+    pkt[12:16] = socket.inet_aton(EXTERNAL_IP)
+    struct.pack_into("!H", pkt, l4_offset, new_src_port)
+
+    _recalculate_checksums(pkt, ihl, protocol, l4_offset)
     return bytes(pkt)
+
+
+def nat_inbound(ip_bytes: bytes) -> bytes | None:
+    """Inbound NAT: rewrite destination IP/port for packets returning to the red network.
+    
+    Looks up the destination port in the reverse table and restores the
+    original internal IP/port.  Returns None if no mapping exists (drop).
+    Non-TCP/UDP packets are passed through unchanged.
+    """
+    parsed = _parse_ip_l4(ip_bytes)
+    if parsed is None:
+        return ip_bytes  # Pass through non-NATtable packets
+
+    version, ihl, protocol, l4_offset, src_ip, dst_ip, src_port, dst_port = parsed
+    print(f"[NAT IN] {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
+
+    if dst_ip != EXTERNAL_IP:
+        return ip_bytes  # Not addressed to us, pass through
+
+    cleanup_expired()
+
+    if dst_port not in REVERSE_TABLE:
+        print(f"[NAT IN] No mapping for port {dst_port}, dropping")
+        return None  # Drop — no mapping
+
+    (internal_ip, internal_port), _ = REVERSE_TABLE[dst_port]
+
+    # Refresh timestamps
+    REVERSE_TABLE[dst_port] = ((internal_ip, internal_port), time.time())
+    NAT_TABLE[(internal_ip, internal_port)]['last_seen'] = time.time()
+
+    pkt = bytearray(ip_bytes)
+    pkt[16:20] = socket.inet_aton(internal_ip)
+    struct.pack_into("!H", pkt, l4_offset + 2, internal_port)
+
+    _recalculate_checksums(pkt, ihl, protocol, l4_offset)
+    return bytes(pkt)
+
+
+def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
+    """Auto-detecting convenience wrapper (used by test harness).
+    
+    Routes to nat_outbound or nat_inbound based on the destination IP.
+    """
+    parsed = _parse_ip_l4(packet_bytes)
+    if parsed is None:
+        return packet_bytes
+
+    _, _, _, _, _, dst_ip, _, dst_port = parsed
+
+    print("Got packet to", dst_ip, dst_port)
+
+    if dst_ip == EXTERNAL_IP:
+        return nat_inbound(packet_bytes)
+    else:
+        return nat_outbound(packet_bytes)
