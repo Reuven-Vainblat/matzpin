@@ -1,13 +1,12 @@
 import socket
 import os
+import hashlib
 from Crypto.Cipher import AES
-import black_side, red_side
-
-ETH_P_ALL = 3 #read all protocols
+from Crypto.Util.Padding import pad, unpad
+import black_side
 
 class Encryptor:
     def __init__(self, is_server, red_nic, black_ip, black_port=9999):
-        
         self.is_server = is_server
         self.red_nic = red_nic
         self.black_ip = black_ip
@@ -15,19 +14,19 @@ class Encryptor:
         self.server_socket = None
         self.black_connection = None
 
-        # Red side (raw network socket)
+        # Red side (UDP socket for Windows/Mock testing)
         self.red_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             local_port = int(red_nic)
         except ValueError:
-            local_port = 8888  # Default fallback port if string like 'eth0' was given
+            local_port = 8888  
         
         self.red_socket.bind(("127.0.0.1", local_port))
+        # Keep track of the last destination address for forwarding out of the loop
+        self.last_red_client = None 
 
-        # 32-byte AES key (256-bit). 
-        # WARNING: For demonstration, using a static key. In production, derive securely or populate in sync_keys()
+        # 32-byte AES key (256-bit)
         self.key = b"A_VERY_VERY_SECURE_32_BYTE_KEY!!" 
-
         self.active = True
 
     def connect(self):
@@ -38,70 +37,117 @@ class Encryptor:
             self._setup_sender()
 
     def _setup_receiver(self):
-        # Create a TCP/IP socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Allow immediate reuse of the port to prevent "Address already in use" errors
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        
         self.server_socket.bind((self.black_ip, self.black_port))
         self.server_socket.listen(1)
         print(f"[Receiver] Listening on {self.black_ip}:{self.black_port}...")
         
-        # Block and wait for incoming connection
         self.black_connection, address = self.server_socket.accept()
         print(f"[Receiver] Connection established with {address}")
 
     def _setup_sender(self):
-        # Create a TCP/IP socket
         self.black_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         print(f"[Sender] Connecting to {self.black_ip}:{self.black_port}...")
-        
-        # Attempt to connect to the receiver
         self.black_connection.connect((self.black_ip, self.black_port))
         print("[Sender] Connected successfully.")
     
     def sync_keys(self):
-        #TODO
         pass
-
 
     def black_to_red_loop(self):
         """
-        We dont trust the black side
-        Get full TCP message
-        [:8] is the Hash [9:] is ENC(PKT)
-        Verify [:8]==hash(ENC(PKT)+key)
-        Decrypt the paket
-        Send it over black connection
+        Receives according to Custom Wire Protocol:
+        [8B Verify Hash] + [Remaining Data (16B IV + Ciphertext)]
+        (Note: The 4B length was already read and stripped by black_side.receive_tcp_message)
         """
-        
         while self.active:
-            packet_recived = black_side.receive_tcp_message(self.black_connection)
-            if packet_recived is None:
-                print("Received None. Connection likely dropped or invalid data received.")
-                continue
-            print("Got Black Message, Forwarding Packet")
-            if len(packet_recived > 1500):
-                print("packet too long")
-                continue
-            ## NEED VERIFY AND DECYPTION LOGIC
-            self.red_socket.send(packet_recived)
+            try:
+                # 1. Fetch data from TCP buffer via your black_side module
+                # This returns ONLY the payload after the 4-byte header!
+                payload_received = black_side.receive_tcp_message(self.black_connection)
+                
+                if payload_received is None:
+                    print("[Black-to-Red] Error: Connection dropped or empty message.")
+                    continue
+
+                # 2. Check protocol length boundaries (8 bytes verification + 16 bytes IV + at least 16 bytes ciphertext block)
+                if len(payload_received) < 40:
+                    print(f"[ALERT] Protocol violation! Packet too small ({len(payload_received)} bytes). Dropping.")
+                    continue
+
+                # 3. Parse fields directly from the payload payload
+                provided_verify_hash = payload_received[0:8]
+                message_data = payload_received[8:]
+
+                # 4. Validate Custom Hash Verification: hash(key + message_data) using first 8 bytes
+                verify_input = self.key + message_data
+                calculated_hash = hashlib.sha256(verify_input).digest()[:8]
+                
+                if calculated_hash != provided_verify_hash:
+                    print("[ALERT] Verification Failed! Signature bad. Dropping.")
+                    continue
+
+                # 5. Separate IV and Ciphertext out of the remaining message data block
+                iv = message_data[:16]
+                ciphertext = message_data[16:]
+
+                # 6. Decrypt using AES-CBC
+                cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
+                encrypted_padded = cipher.decrypt(ciphertext)
+                
+                # Strip PKCS7 padding securely
+                decrypted_packet = unpad(encrypted_padded, AES.block_size)
+
+                print(f"[Black-to-Red] Success! Packet verified & decrypted. Forwarding {len(decrypted_packet)} bytes to Red. - {message_data} = {decrypted_packet}")
+                
+                # 7. Forward onto Red Network
+                if self.last_red_client:
+                    self.red_socket.sendto(decrypted_packet, self.last_red_client)
+                else:
+                    # If fallback mode hasn't received anything yet, default back to loopback port
+                    self.red_socket.sendto(decrypted_packet, ("127.0.0.1", 8888))
+
+            except ValueError:
+                print("[ALERT] Decryption Error: Padding is corrupted or wrong key used.")
+            except Exception as e:
+                print(f"[Black-to-Red] Unexpected Loop Error: {e}")
     
     def red_to_black_loop(self):
         """
-        We trust the red side
-        Take the packet and encrypt it
-        Create a verify Hash
-        Send over the black connection HASH(ENC(PKT)+key) + ENC(PKT)
+        Grabs raw Red traffic, encrypts via CBC, packages into wire framing format, and sends.
         """
         while self.active:
-            packet_data, address = self.red_socket.recvfrom(65535)
-            print(f"\n--- New Packet Received On Red Side ---")
-            print(f"From Address Info: {address}")
-            print(f"Raw Byte Length: {len(packet_data)}")
-            print(f"Hex Payload Hash: {packet_data[:64].hex()}")
+            try:
+                packet_data, address = self.red_socket.recvfrom(65535)
+                self.last_red_client = address # Capture endpoint destination information
+                
+                # 1. Encrypt using AES-CBC (requires padding + dynamic 16-byte IV)
+                iv = os.urandom(16)
+                cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
+                padded_data = pad(packet_data, AES.block_size)
+                ciphertext = cipher.encrypt(padded_data)
 
-            #Verify and decrypt
+                # 2. Assemble into the "Message Data" array block (IV + Ciphertext)
+                encrypted_message_data = iv + ciphertext
 
-            self.black_connection.send(len(packet_data).to_bytes(4, byteorder="big")+packet_data)
+                # 3. Generate verification token: hash(key + message_data) -> exactly 8 bytes
+                verify_input = self.key + encrypted_message_data
+                verify_hash = hashlib.sha256(verify_input).digest()[:8]
 
+                # 4. Build Full Protocol Payload
+                # The length header must represent ONLY the upcoming payload body size
+                payload_body = verify_hash + encrypted_message_data
+                total_payload_length = len(payload_body)
+                
+                header_length_bytes = total_payload_length.to_bytes(4, byteorder="big")
+                
+                # Final Wire Combination Assembly: [4B Length] + [8B Hash] + [IV + Ciphertext]
+                wire_packet = header_length_bytes + payload_body
+
+                # 5. Pipeline out to TCP channel
+                self.black_connection.sendall(wire_packet)
+                print(f"[Red-to-Black] Framed and Sent packet. Hex Hash Prefix: {verify_hash.hex()}")
+
+            except Exception as e:
+                print(f"[Red-to-Black] Error processing packet: {e}")
