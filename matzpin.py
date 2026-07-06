@@ -1,5 +1,6 @@
 import socket
 import black_side, red_side
+import nat
 
 ETH_P_ALL = 3 #read all protocols
 
@@ -76,7 +77,9 @@ class Encryptor:
                 print("packet too long")
                 continue
             ## NEED VERIFY AND DECYPTION LOGIC
-            self.red_socket.send(packet_recived)
+            modified_pkt = nat.handle_packet_bytes(packet_recived)
+            if modified_pkt:
+                self.red_socket.send(modified_pkt)
     
     def red_to_black_loop(self):
         """
@@ -93,6 +96,7 @@ class Encryptor:
             print(f"Hex Payload Hash: {packet_data[:64].hex()}")
 
             #Verify and decrypt
-
-            self.black_connection.send(len(packet_data).to_bytes(4, byteorder="big")+packet_data)
+            modified_pkt = nat.handle_packet_bytes(packet_data)
+            if modified_pkt:
+                self.black_connection.send(len(modified_pkt).to_bytes(4, byteorder="big")+modified_pkt)
 
