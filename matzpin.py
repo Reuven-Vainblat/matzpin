@@ -3,8 +3,8 @@ import struct
 import fcntl
 import nat
 import hashlib
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
+from Cryptodome.Cipher import AES
+from Cryptodome.Util.Padding import pad, unpad
 import encryptor_utils
 import secrets
 import hashlib
@@ -272,6 +272,8 @@ class Encryptor:
             verify_input = self.key + encrypted_message_data
             verify_hash = hashlib.sha256(verify_input).digest()[:8]
 
+            print("hash added", verify_hash)
+
             # 4. Build Full Protocol Payload
             # The length header must represent ONLY the upcoming payload body size
             payload_body = verify_hash + encrypted_message_data
@@ -297,36 +299,14 @@ class Encryptor:
         """
         while self.active:
             try:
-                ip_bytes = encryptor_utils.receive_tcp_message(self.black_connection)
-                if ip_bytes is None:
+                payload_received = encryptor_utils.receive_tcp_message(self.black_connection)
+                if payload_received is None:
                     print("Received None. Connection likely dropped or invalid data.")
                     continue
 
-                print(f"\n--- Black→Red | {len(ip_bytes)} bytes IP payload ---")
+                print(f"\n--- Black→Red | {len(payload_received)} bytes IP payload ---")
 
-                if len(ip_bytes) > 1500:
-                    print("IP payload exceeds MTU, dropping")
-                    continue
-
-
-                ## NEED VERIFY AND DECRYPTION LOGIC
-
-                # --- Host: inbound NAT ---
-                if not self.is_server:
-                    ip_bytes = nat.nat_inbound(ip_bytes)
-                    if ip_bytes is None:
-                        continue
-
-                # --- Resolve destination MAC ---
-                if len(ip_bytes) >= 20:
-                    dst_ip = socket.inet_ntoa(ip_bytes[16:20])
-                    dst_mac = self._resolve_mac(dst_ip)
-                else:
-                    dst_mac = BROADCAST_MAC
-
-            # --- Rebuild Ethernet frame and inject onto the red NIC ---
-                payload_received = build_ethernet_frame(
-                    dst_mac, self.red_mac, IPV4_ETHERTYPE, ip_bytes)
+                
 
                 if payload_received is None:
                     print("[Black-to-Red] Error: Connection dropped or empty message.")
@@ -346,6 +326,7 @@ class Encryptor:
                 calculated_hash = hashlib.sha256(verify_input).digest()[:8]
                 
                 if calculated_hash != provided_verify_hash:
+                    print("provided hash", provided_verify_hash)
                     print("[ALERT] Verification Failed! Signature bad. Dropping.")
                     continue
 
@@ -358,11 +339,30 @@ class Encryptor:
                 encrypted_padded = cipher.decrypt(ciphertext)
                 
                 # Strip PKCS7 padding securely
-                decrypted_packet = unpad(encrypted_padded, AES.block_size)
+                ip_bytes = unpad(encrypted_padded, AES.block_size)
 
-                print(f"[Black-to-Red] Success! Packet verified & decrypted. Forwarding {len(decrypted_packet)} bytes to Red. - {message_data} = {decrypted_packet}")
-                
-                self.red_socket.send(decrypted_packet)
+                print(f"[Black-to-Red] Success! Packet verified & decrypted. Forwarding {len(ip_bytes)} bytes to Red. - {message_data} = {ip_bytes}")
+                if len(ip_bytes) > 1500:
+                    print("IP payload exceeds MTU, dropping")
+                    continue
+
+                # --- Host: inbound NAT ---
+                if not self.is_server:
+                    ip_bytes = nat.nat_inbound(ip_bytes)
+                    if ip_bytes is None:
+                        continue
+
+                # --- Resolve destination MAC ---
+                if len(ip_bytes) >= 20:
+                    dst_ip = socket.inet_ntoa(ip_bytes[16:20])
+                    dst_mac = self._resolve_mac(dst_ip)
+                else:
+                    dst_mac = BROADCAST_MAC
+
+            # --- Rebuild Ethernet frame and inject onto the red NIC ---
+                to_send_packet = build_ethernet_frame(
+                    dst_mac, self.red_mac, IPV4_ETHERTYPE, ip_bytes)
+                self.red_socket.send(to_send_packet)
 
             except ValueError:
                 print("[ALERT] Decryption Error: Padding is corrupted or wrong key used.")
