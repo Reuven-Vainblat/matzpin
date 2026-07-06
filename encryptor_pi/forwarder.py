@@ -18,6 +18,7 @@ def forward_plaintext_over_tls(plaintext: bytes, config: PiConfig) -> bytes:
     """Forward plaintext to the configured downstream service over TLS."""
 
     context = ssl.create_default_context(cafile=config.ca_cert_path)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     try:
         LOGGER.info(
             "Pi forwarding plaintext to downstream %s:%s: %s bytes",
@@ -34,6 +35,6 @@ def forward_plaintext_over_tls(plaintext: bytes, config: PiConfig) -> bytes:
                 response = recv_framed_message(tls_sock, config.max_message_size)
                 LOGGER.info("Pi received downstream response: %s bytes", len(response))
                 return response
-    except OSError as exc:
+    except Exception as exc:
         raise ForwardingError("Failed to forward payload over TLS") from exc
 

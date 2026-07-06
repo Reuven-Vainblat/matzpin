@@ -30,6 +30,7 @@ def run_client(config: DemiClientConfig) -> None:
     """Accept one forwarded plaintext message and send the configured response."""
 
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=config.tls_cert_path, keyfile=config.tls_key_path)
 
     with socket.create_server((config.host, config.port), reuse_port=False) as listener:

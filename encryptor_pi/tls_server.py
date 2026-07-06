@@ -10,6 +10,7 @@ from encryptor_common.framing import recv_framed_message, send_framed_message
 
 from .config import PiConfig
 from .processor import handle_message
+from .rate_limiter import FixedWindowRateLimiter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +19,7 @@ def create_ssl_context(config: PiConfig) -> ssl.SSLContext:
     """Create a server SSL context that requires client certificates."""
 
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=config.pi_cert_path, keyfile=config.pi_key_path)
     context.load_verify_locations(cafile=config.ca_cert_path)
     context.verify_mode = ssl.CERT_REQUIRED
@@ -28,11 +30,20 @@ def run_server(config: PiConfig) -> None:
     """Run the blocking Pi TLS server loop forever."""
 
     context = create_ssl_context(config)
+    limiter = FixedWindowRateLimiter(
+        window_seconds=config.rate_limit_window_seconds,
+        max_events=config.max_connections_per_window,
+    )
     with socket.create_server((config.host, config.port), reuse_port=False) as server_sock:
         LOGGER.info("Pi daemon listening on %s:%s", config.host, config.port)
         while True:
             client_sock, address = server_sock.accept()
             with client_sock:
+                source_ip = address[0]
+                if not limiter.allow(source_ip):
+                    LOGGER.warning("Rejected Pi client connection from %s: rate limit exceeded", address)
+                    continue
+
                 client_sock.settimeout(config.request_timeout_seconds)
                 try:
                     LOGGER.info("Pi accepted TCP connection from %s", address)

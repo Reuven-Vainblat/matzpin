@@ -17,6 +17,7 @@ def send_envelope(raw_envelope: bytes, config: ServerConfig) -> bytes:
     """Send one framed envelope to the Pi and return one framed response."""
 
     context = ssl.create_default_context(cafile=config.ca_cert_path)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(certfile=config.server_cert_path, keyfile=config.server_key_path)
     source_address = _source_address(config)
     LOGGER.info("Server connecting to Pi %s:%s", config.pi_host, config.pi_port)

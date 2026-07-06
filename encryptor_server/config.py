@@ -8,6 +8,13 @@ import os
 from pathlib import Path
 from typing import Any
 
+from encryptor_common.config_validation import (
+    require_message_size,
+    require_non_empty,
+    require_port,
+    require_positive_float,
+)
+
 
 @dataclass(frozen=True)
 class ServerConfig:
@@ -41,7 +48,7 @@ def load_config(path: str | None = None) -> ServerConfig:
     if config_path:
         data.update(json.loads(Path(config_path).read_text(encoding="utf-8")))
 
-    return ServerConfig(
+    config = ServerConfig(
         pi_host=_get(data, "pi_host", "SERVER_PI_HOST", "127.0.0.1"),
         pi_port=int(_get(data, "pi_port", "SERVER_PI_PORT", 8443)),
         ca_cert_path=_get(data, "ca_cert_path", "SERVER_CA_CERT", "server/certs/ca.crt"),
@@ -67,6 +74,8 @@ def load_config(path: str | None = None) -> ServerConfig:
         local_host=_optional_str(_get(data, "local_host", "SERVER_LOCAL_HOST", None)),
         local_port=int(_get(data, "local_port", "SERVER_LOCAL_PORT", 0)),
     )
+    validate_config(config)
+    return config
 
 
 def _get(data: dict[str, Any], key: str, env_name: str, default: Any) -> Any:
@@ -82,3 +91,23 @@ def _optional_str(value: Any) -> str | None:
         return None
     value = str(value)
     return value or None
+
+
+def validate_config(config: ServerConfig) -> None:
+    """Reject invalid server runtime settings at startup."""
+
+    require_non_empty("pi_host", config.pi_host)
+    require_port("pi_port", config.pi_port)
+    require_non_empty("ca_cert_path", config.ca_cert_path)
+    require_non_empty("server_cert_path", config.server_cert_path)
+    require_non_empty("server_key_path", config.server_key_path)
+    require_non_empty("sender_id", config.sender_id)
+    require_non_empty("recipient_id", config.recipient_id)
+    require_non_empty("key_id", config.key_id)
+    require_non_empty("signing_private_key_path", config.signing_private_key_path)
+    require_non_empty("pi_x25519_public_key_path", config.pi_x25519_public_key_path)
+    require_message_size(config.max_message_size)
+    require_positive_float("timeout_seconds", config.timeout_seconds)
+    if config.local_host is not None:
+        require_non_empty("local_host", config.local_host)
+    require_port("local_port", config.local_port, allow_zero=True)

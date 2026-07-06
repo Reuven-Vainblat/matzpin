@@ -14,6 +14,26 @@ from typing import Any
 
 from .errors import ProtocolError
 
+REQUIRED_ENVELOPE_FIELDS = {
+    "version",
+    "message_id",
+    "timestamp",
+    "sender_id",
+    "recipient_id",
+    "key_id",
+    "ephemeral_public_key",
+    "nonce",
+    "ciphertext",
+    "signature",
+    "aad",
+}
+MAX_ID_LENGTH = 128
+MAX_KEY_ID_LENGTH = 64
+MAX_TIMESTAMP_LENGTH = 64
+MAX_SMALL_B64_LENGTH = 128
+MAX_CIPHERTEXT_LENGTH = 1_400_000
+MAX_AAD_JSON_LENGTH = 8_192
+
 
 @dataclass(frozen=True)
 class MessageEnvelope:
@@ -47,8 +67,9 @@ def parse_envelope(raw: bytes) -> MessageEnvelope:
 
     try:
         payload = json.loads(raw.decode("utf-8"))
+        _validate_envelope_payload(payload)
         return MessageEnvelope(**payload)
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
         raise ProtocolError("Invalid message envelope") from exc
 
 
@@ -96,3 +117,49 @@ def _canonical_json(payload: dict[str, Any]) -> bytes:
     """Encode JSON with stable key ordering and compact separators."""
 
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _validate_envelope_payload(payload: Any) -> None:
+    """Validate envelope shape and field sizes before constructing a dataclass."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("Envelope must be a JSON object")
+
+    fields = set(payload)
+    if fields != REQUIRED_ENVELOPE_FIELDS:
+        missing = REQUIRED_ENVELOPE_FIELDS - fields
+        extra = fields - REQUIRED_ENVELOPE_FIELDS
+        raise ValueError(f"Envelope fields mismatch; missing={missing}, extra={extra}")
+
+    if not isinstance(payload["version"], int) or isinstance(payload["version"], bool):
+        raise ValueError("Envelope version must be an integer")
+
+    _require_string(payload, "message_id", MAX_ID_LENGTH)
+    _require_string(payload, "timestamp", MAX_TIMESTAMP_LENGTH)
+    _require_string(payload, "sender_id", MAX_ID_LENGTH)
+    _require_string(payload, "recipient_id", MAX_ID_LENGTH)
+    _require_string(payload, "key_id", MAX_KEY_ID_LENGTH)
+    _require_string(payload, "ephemeral_public_key", MAX_SMALL_B64_LENGTH)
+    _require_string(payload, "nonce", MAX_SMALL_B64_LENGTH)
+    _require_string(payload, "ciphertext", MAX_CIPHERTEXT_LENGTH)
+    _require_string(payload, "signature", MAX_SMALL_B64_LENGTH)
+
+    aad = payload["aad"]
+    if not isinstance(aad, dict):
+        raise ValueError("Envelope aad must be an object")
+    try:
+        aad_json = _canonical_json(aad)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Envelope aad must be JSON serializable") from exc
+    if len(aad_json) > MAX_AAD_JSON_LENGTH:
+        raise ValueError("Envelope aad is too large")
+
+
+def _require_string(payload: dict[str, Any], key: str, max_length: int) -> None:
+    value = payload[key]
+    if not isinstance(value, str):
+        raise ValueError(f"Envelope {key} must be a string")
+    if not value:
+        raise ValueError(f"Envelope {key} must not be empty")
+    if len(value) > max_length:
+        raise ValueError(f"Envelope {key} is too long")
