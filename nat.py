@@ -2,6 +2,10 @@ import time
 import socket
 import struct
 
+# This NAT rewrites IPv4 TCP/UDP packets crossing the encryptor.
+# The red side uses Linux AF_PACKET sockets, so packets usually arrive as full
+# Ethernet frames. The code therefore first finds the IPv4 header, then applies
+# NAT relative to that header instead of assuming byte 0 is always IPv4.
 EXTERNAL_IP = "10.60.44.6"
 TIMEOUT = 30  # seconds
 
@@ -10,6 +14,9 @@ NAT_TABLE = {}
 # REVERSE_TABLE: ext_port -> ((src_ip, src_port), last_seen)
 REVERSE_TABLE = {}
 NEXT_PORT = 40000
+ETHERNET_HEADER_LEN = 14
+ETHERTYPE_IPV4 = 0x0800
+VLAN_ETHERTYPES = {0x8100, 0x88A8, 0x9100}
 
 
 def calculate_checksum(data: bytes) -> int:
@@ -53,34 +60,82 @@ def allocate_port(src_ip, src_port):
     return NAT_TABLE[(src_ip, src_port)]['port']
 
 
-def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
-    # Require at least the minimum IPv4 header length
-    if len(packet_bytes) < 20:
-        return packet_bytes
+def _ipv4_lengths_at(packet_bytes: bytes, ip_offset: int) -> tuple[int, int] | None:
+    """Return (ihl, total_length) if an IPv4 header starts at ip_offset."""
+    # IPv4 has a minimum 20-byte header. IHL tells us the real header length,
+    # and total_length tells us how much of the frame belongs to the IP datagram.
+    if len(packet_bytes) < ip_offset + 20:
+        return None
 
-    # Parse IP Version and Header Length
-    ver_ihl = packet_bytes[0]
+    ver_ihl = packet_bytes[ip_offset]
     version = ver_ihl >> 4
-    if version != 4:  # Drop if not IPv4
-        return packet_bytes
-    
+    if version != 4:
+        return None
+
     ihl = (ver_ihl & 0x0F) * 4
-    if len(packet_bytes) < ihl:
+    if ihl < 20 or len(packet_bytes) < ip_offset + ihl:
+        return None
+
+    total_len = struct.unpack("!H", packet_bytes[ip_offset + 2:ip_offset + 4])[0]
+    if total_len < ihl or len(packet_bytes) < ip_offset + total_len:
+        return None
+
+    return ihl, total_len
+
+
+def _find_ipv4_header(packet_bytes: bytes) -> tuple[int, int, int] | None:
+    """Locate IPv4 in either a raw IP packet or an Ethernet frame."""
+    # AF_PACKET gives us Ethernet headers. EtherType 0x0800 means the payload is
+    # IPv4, while VLAN tags add 4-byte wrappers before the real EtherType.
+    if len(packet_bytes) >= ETHERNET_HEADER_LEN:
+        ethertype = struct.unpack("!H", packet_bytes[12:14])[0]
+        ip_offset = ETHERNET_HEADER_LEN
+
+        while ethertype in VLAN_ETHERTYPES:
+            if len(packet_bytes) < ip_offset + 4:
+                return None
+            ethertype = struct.unpack("!H", packet_bytes[ip_offset + 2:ip_offset + 4])[0]
+            ip_offset += 4
+
+        if ethertype == ETHERTYPE_IPV4:
+            lengths = _ipv4_lengths_at(packet_bytes, ip_offset)
+            if lengths is not None:
+                ihl, total_len = lengths
+                return ip_offset, ihl, total_len
+
+    lengths = _ipv4_lengths_at(packet_bytes, 0)
+    if lengths is None:
+        return None
+
+    # Keep supporting raw IPv4 bytes as well. That makes tests and any future
+    # non-Ethernet caller work with the same NAT function.
+    ihl, total_len = lengths
+    return 0, ihl, total_len
+
+
+def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
+    # ip_offset is 0 for raw IPv4 packets and 14 or more for Ethernet frames.
+    # All IP and TCP/UDP offsets below are calculated relative to this value.
+    ip_info = _find_ipv4_header(packet_bytes)
+    if ip_info is None:
         return packet_bytes
+    ip_offset, ihl, total_len = ip_info
+    ip_end = ip_offset + total_len
 
     # Protocol check (6 = TCP, 17 = UDP)
-    protocol = packet_bytes[9]
+    protocol = packet_bytes[ip_offset + 9]
     if protocol not in (6, 17):
         return packet_bytes
 
-    # Ensure Layer 4 header is present (8 bytes min for both TCP/UDP)
-    l4_offset = ihl
-    if len(packet_bytes) < l4_offset + 8:
+    # Ensure the full TCP/UDP header is present inside the IP datagram.
+    min_l4_len = 20 if protocol == 6 else 8
+    if total_len < ihl + min_l4_len:
         return packet_bytes
+    l4_offset = ip_offset + ihl
 
     # Extract IPs
-    src_ip_bytes = packet_bytes[12:16]
-    dst_ip_bytes = packet_bytes[16:20]
+    src_ip_bytes = packet_bytes[ip_offset + 12:ip_offset + 16]
+    dst_ip_bytes = packet_bytes[ip_offset + 16:ip_offset + 20]
     src_ip = socket.inet_ntoa(src_ip_bytes)
     dst_ip = socket.inet_ntoa(dst_ip_bytes)
 
@@ -93,12 +148,16 @@ def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
     # Apply NAT Logic based on exactly how your scapy script behaved
     if src_ip.startswith("192.168."):
         # --- OUTBOUND ---
+        # Internal red-side clients are hidden behind EXTERNAL_IP, with a
+        # per-flow external source port stored in NAT_TABLE/REVERSE_TABLE.
         new_src_port = allocate_port(src_ip, src_port)
-        pkt[12:16] = socket.inet_aton(EXTERNAL_IP)
+        pkt[ip_offset + 12:ip_offset + 16] = socket.inet_aton(EXTERNAL_IP)
         struct.pack_into("!H", pkt, l4_offset, new_src_port)
         
     elif dst_ip == EXTERNAL_IP:
         # --- INBOUND ---
+        # Return traffic is accepted only if the destination port matches a
+        # previously allocated mapping. Unknown inbound flows are dropped.
         cleanup_expired()
         if dst_port in REVERSE_TABLE:
             (internal_ip, internal_port), _ = REVERSE_TABLE[dst_port]
@@ -106,7 +165,7 @@ def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
             REVERSE_TABLE[dst_port] = ((internal_ip, internal_port), time.time())
             NAT_TABLE[(internal_ip, internal_port)]['last_seen'] = time.time()
             
-            pkt[16:20] = socket.inet_aton(internal_ip)
+            pkt[ip_offset + 16:ip_offset + 20] = socket.inet_aton(internal_ip)
             struct.pack_into("!H", pkt, l4_offset + 2, internal_port)
         else:
             return None  # Drop packet
@@ -114,7 +173,7 @@ def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
     else:
         # --- FALLBACK (matching your final `else` condition) ---
         new_src_port = allocate_port(src_ip, src_port)
-        pkt[12:16] = socket.inet_aton(EXTERNAL_IP)
+        pkt[ip_offset + 12:ip_offset + 16] = socket.inet_aton(EXTERNAL_IP)
         struct.pack_into("!H", pkt, l4_offset, new_src_port)
 
 
@@ -123,12 +182,14 @@ def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
     # ==========================
     
     # 1. IP Checksum
-    pkt[10:12] = b'\x00\x00'  # Zero out old checksum
-    ip_header = pkt[0:ihl]
-    struct.pack_into("!H", pkt, 10, calculate_checksum(ip_header))
+    pkt[ip_offset + 10:ip_offset + 12] = b'\x00\x00'  # Zero out old checksum
+    ip_header = pkt[ip_offset:ip_offset + ihl]
+    struct.pack_into("!H", pkt, ip_offset + 10, calculate_checksum(ip_header))
 
     # 2. Layer 4 Checksum
-    l4_len = len(pkt) - ihl
+    # Use the IPv4 total length, not len(pkt), because Ethernet frames can carry
+    # padding/trailing bytes that are not part of the TCP/UDP checksum input.
+    l4_len = total_len - ihl
     
     if protocol == 6:  # TCP
         csum_offset = l4_offset + 16
@@ -139,9 +200,16 @@ def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
 
     # Create IP pseudo-header required for TCP/UDP checksum calculations
     # Src IP (4), Dst IP (4), Zero (1), Protocol (1), L4 Length (2)
-    pseudo_header = struct.pack("!4s4sBBH", pkt[12:16], pkt[16:20], 0, protocol, l4_len)
+    pseudo_header = struct.pack(
+        "!4s4sBBH",
+        pkt[ip_offset + 12:ip_offset + 16],
+        pkt[ip_offset + 16:ip_offset + 20],
+        0,
+        protocol,
+        l4_len,
+    )
     
-    l4_checksum = calculate_checksum(pseudo_header + pkt[l4_offset:])
+    l4_checksum = calculate_checksum(pseudo_header + pkt[l4_offset:ip_end])
     
     # UDP specific rule: if calculated checksum is 0, it must be set to 0xFFFF
     if protocol == 17 and l4_checksum == 0:
