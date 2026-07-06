@@ -1,4 +1,6 @@
 import socket
+import os
+from Crypto.Cipher import AES
 import black_side, red_side
 
 ETH_P_ALL = 3 #read all protocols
@@ -13,13 +15,20 @@ class Encryptor:
         self.server_socket = None
         self.black_connection = None
 
-        self.red_socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
-        self.red_socket.bind((red_nic,0))
+        # Red side (raw network socket)
+        self.red_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            local_port = int(red_nic)
+        except ValueError:
+            local_port = 8888  # Default fallback port if string like 'eth0' was given
+        
+        self.red_socket.bind(("127.0.0.1", local_port))
 
-        self.key = ""
+        # 32-byte AES key (256-bit). 
+        # WARNING: For demonstration, using a static key. In production, derive securely or populate in sync_keys()
+        self.key = b"A_VERY_VERY_SECURE_32_BYTE_KEY!!" 
 
         self.active = True
-
 
     def connect(self):
         """Establishes the connection based on the mode."""
