@@ -4,11 +4,11 @@ import threading, sys
 
 def main():
     if len(sys.argv) < 5 or (sys.argv[1] not in ("server", "host")):
-        print("Usage: python script.py [server|host] <red_nic> <black_ip> <black_port>")
+        print("Usage: python main.py [server|host] <red_nic> <black_ip> <black_port>")
         return
 
-    encryptor = Encryptor(sys.argv[1] == "server", sys.argv[2], sys.argv[3], int(sys.argv[4]))
-
+    encryptor = Encryptor((sys.argv[1] == "server"), sys.argv[2], sys.argv[3], int(sys.argv[4]))
+    
     encryptor.connect()
 
     encryptor.sync_keys()
@@ -22,5 +22,4 @@ def main():
 
 
 if __name__ == "__main__":
-    print("Starting Encryptor")
     main()
