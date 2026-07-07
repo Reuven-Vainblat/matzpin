@@ -9,6 +9,8 @@ import encryptor_utils
 import secrets
 import hashlib
 import os
+import sys
+import json
 
 from arp_handler import (
     ArpTable, parse_ethernet_header, build_ethernet_frame,
@@ -56,8 +58,6 @@ class Encryptor:
 
         # Retrieve our own MAC from the NIC
         self.red_mac = self._get_nic_mac(red_nic)
-        print(f"[Init] Red NIC '{red_nic}' MAC: {self.red_mac.hex(':')}")
-        print(f"[Init] Red IP: {red_ip}  |  Mode: {'server' if is_server else 'host'}")
 
         # ARP table for red-side MAC resolution
         self.arp_table = ArpTable()
@@ -67,7 +67,67 @@ class Encryptor:
         self.active = True
 
         self.replay_window = encryptor_utils.ReplayWindow(window_size=64)
-        self.packet_counter = 0  # Initialize packet counter for sequence numbers
+        self.sequence_counter = 0  # Initialize packet counter for sequence numbers
+
+        self.red_sent_cnt = 0
+        self.red_drop_cnt = 0
+        self.black_sent_cnt = 0
+        self.black_drop_cnt = 0
+        self.bytes_counter = 0
+
+        # Determine log file path based on OS
+        if sys.platform.startswith('win'):
+            self.log_file_path = "matzpin.log"
+        else:
+            self.log_file_path = "/var/log/matzpin.log"
+
+    # ──────────────────────────────────────
+    # Network helpers
+    # ──────────────────────────────────────
+
+    def _stream_log(self, category, message):
+        """Builds and appends telemetry logs as a single-line JSON locally to a platform-specific file."""
+        try:
+            total_red = self.red_sent_cnt + self.red_drop_cnt
+            red_drop_pct = (self.red_drop_cnt / total_red * 100) if total_red > 0 else 0.0
+            
+            total_black = self.black_sent_cnt + self.black_drop_cnt
+            black_drop_pct = (self.black_drop_cnt / total_black * 100) if total_black > 0 else 0.0
+            
+            matzpin_type = "SERVER" if self.is_server else "HOST"
+
+            log_payload = {
+                "log_type": matzpin_type,
+                "category": category,
+                "total_transferred_bytes": self.bytes_counter,
+                "red": {
+                    "sent": self.red_sent_cnt,
+                    "drop": self.red_drop_cnt,
+                    "drop_percentage": round(red_drop_pct, 1),
+                    "ddos_alert": (red_drop_pct > 30.0 and total_red > 10),
+                    "port": self.red_nic,
+                    "ip": self.red_ip
+                },
+                "black": {
+                    "sent": self.black_sent_cnt,
+                    "drop": self.black_drop_cnt,
+                    "drop_percentage": round(black_drop_pct, 1),
+                    "ddos_alert": (black_drop_pct > 30.0 and total_black > 10),
+                    "port": self.black_port,
+                    "ip": self.black_ip
+                },
+                "log": message
+            }
+            
+            # Serialize to a single-line JSON string
+            log_line = json.dumps(log_payload)
+            
+            # Append to Local Log File
+            with open(self.log_file_path, "a", encoding="utf-8") as f:
+                f.write(log_line + "\n")
+
+        except Exception:
+            pass # Fail silently to prioritize core encryption throughput
 
     # ──────────────────────────────────────
     # Helpers
@@ -105,23 +165,21 @@ class Encryptor:
 
         self.server_socket.bind((self.black_ip, self.black_port))
         self.server_socket.listen(1)
-        print(f"[Receiver] Listening on {self.black_ip}:{self.black_port}...")
 
         # Block and wait for incoming connection
         self.black_connection, address = self.server_socket.accept()
-        print(f"[Receiver] Connection established with {address}")
+        self._stream_log("NEW_MATZPIN", f"New TCP receiver")
 
     def _setup_sender(self):
         # Create a TCP/IP socket
         self.black_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        print(f"[Sender] Connecting to {self.black_ip}:{self.black_port}...")
 
         # Attempt to connect to the receiver
         self.black_connection.connect((self.black_ip, self.black_port))
-        print("[Sender] Connected successfully.")
+        self._stream_log("NEW_MATZPIN", f"New TCP sender")
 
     def sync_keys(self):
-        print("[KeySync] Starting Diffie-Hellman Key Exchange...")
+        self._stream_log("KEY_SYNC", f"Starting Diffie-Hellman Key Exchange.")
 
         private_key = secrets.randbits(256)
 
@@ -146,7 +204,7 @@ class Encryptor:
         # using sha256 to create a equalized key for encryption
         self.key = hashlib.sha256(shared_secret_bytes).digest()
         
-        print(f"[KeySync] Key exchange successful. Derived Key (Hex): {self.key.hex()}")
+        self._stream_log("KEY_SYNC", f"Key exchange successful")
 
     # ──────────────────────────────────────
     # ARP handling on the red side
@@ -173,9 +231,9 @@ class Encryptor:
         self.arp_table.update(arp['sender_ip'], arp['sender_mac'])
         
         if arp['opcode'] == ARP_REQUEST:
-            print(f"[ARP] {arp['sender_ip']} is asking: Who has {arp['target_ip']}?")
+            self._stream_log("ARP", f"{arp['sender_ip']} is asking: Who has {arp['target_ip']}?")
         elif arp['opcode'] == ARP_REPLY:
-            print(f"[ARP] Learned {arp['sender_ip']} -> {arp['sender_mac'].hex(':')}")
+            self._stream_log("ARP", f"Learned {arp['sender_ip']} -> {arp['sender_mac'].hex(':')}")
 
         # Reply if it's asking for our IP, OR if we are the host (Proxy ARP for everything else)
         if arp['opcode'] == ARP_REQUEST:
@@ -187,7 +245,7 @@ class Encryptor:
                 reply = build_arp_reply(
                     self.red_mac, arp['target_ip'], # Claim to be the requested IP
                     arp['sender_mac'], arp['sender_ip'])
-                print(f"[ARP] Replying: {arp['target_ip']} is-at {self.red_mac.hex(':')}")
+                self._stream_log("ARP", f"Replying: {arp['target_ip']} is-at {self.red_mac.hex(':')}")
                 return reply
 
         return None
@@ -206,7 +264,7 @@ class Encryptor:
         # Send an ARP who-has for this IP
         arp_req = build_arp_request(self.red_mac, self.red_ip, dst_ip)
         self.red_socket.send(arp_req)
-        print(f"[ARP] Sent who-has for {dst_ip}")
+        self._stream_log("ARP", f"Sent who-has for {dst_ip}")
 
         return BROADCAST_MAC  # fallback until we learn the real MAC
 
@@ -227,83 +285,87 @@ class Encryptor:
         7. Send the packet over the encrypted tunnel
         """
         while self.active:
-            packet_data, _address = self.red_socket.recvfrom(65535)
+            try:
+                packet_data, _address = self.red_socket.recvfrom(65535)
 
-            # --- Parse Ethernet header ---
-            parsed = parse_ethernet_header(packet_data)
-            if parsed is None:
-                # Assuming parse_ethernet_header is defined elsewhere
-                continue
-            dst_mac, src_mac, ethertype, ip_bytes = parsed
+                # --- Parse Ethernet header ---
+                parsed = parse_ethernet_header(packet_data)
+                if parsed is None:
+                    # Assuming parse_ethernet_header is defined elsewhere
+                    continue
+                dst_mac, src_mac, ethertype, ip_bytes = parsed
 
-            # Ignore frames that we sent ourselves (loopback)
-            if src_mac == self.red_mac:
-                continue
-
-            # --- ARP: handle locally, never tunnel ---
-            if ethertype == ARP_ETHERTYPE:
-                reply = self._handle_arp(packet_data)
-                if reply:
-                    self.red_socket.send(reply)
-                continue
-
-            # Only forward IPv4
-            if ethertype != IPV4_ETHERTYPE:
-                continue
-
-            # Learn the source MAC from this frame while we have it
-            if len(ip_bytes) >= 20:
-                src_ip = socket.inet_ntoa(ip_bytes[12:16])
-                self.arp_table.update(src_ip, src_mac)
-
-            print(f"\n--- Red→Black | {len(ip_bytes)} bytes IP payload ---")
-
-            # --- Host: outbound NAT on the clean IP bytes ---
-            if not self.is_server:
-                ip_bytes = nat.nat_outbound(ip_bytes)
-                if ip_bytes is None:
+                # Ignore frames that we sent ourselves (loopback)
+                if src_mac == self.red_mac:
                     continue
 
-            print("Encrypting IP Bytes")
-            
-            # --- 1. Increment & Protect the Sequence Counter ---
-            self.sequence_counter += 1
-            # Check for 64-bit overflow (Hard safety ceiling)
-            if self.sequence_counter > (1 << 64) - 1:
-                raise RuntimeError("Sequence counter overflow! Crypto context exhausted. Keys must be rotated.")
-            
-            # Pack counter into 8 bytes (Big-Endian Unsigned Long Long)
-            counter_bytes = struct.pack(">Q", self.sequence_counter)
+                # --- ARP: handle locally, never tunnel ---
+                if ethertype == ARP_ETHERTYPE:
+                    reply = self._handle_arp(packet_data)
+                    if reply:
+                        self.red_socket.send(reply)
+                    continue
 
-            # 2. Encrypt using AES-CBC (requires padding + dynamic 16-byte IV)
-            iv = os.urandom(16)
-            cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
-            padded_data = pad(ip_bytes, AES.block_size)
-            ciphertext = cipher.encrypt(padded_data)
+                # Only forward IPv4
+                if ethertype != IPV4_ETHERTYPE:
+                    continue
 
-            # 3. Assemble the core message components
-            encrypted_message_data = iv + ciphertext
+                # Learn the source MAC from this frame while we have it
+                if len(ip_bytes) >= 20:
+                    src_ip = socket.inet_ntoa(ip_bytes[12:16])
+                    self.arp_table.update(src_ip, src_mac)
 
-            # 4. Generate verification token
-            # CRITICAL: We include counter_bytes in the hash. 
-            # This cryptographically locks the sequence number so attackers cannot alter it.
-            verify_input = self.key + counter_bytes + encrypted_message_data
-            verify_hash = hashlib.sha256(verify_input).digest()[:8]
+                # --- Host: outbound NAT on the clean IP bytes ---
+                if not self.is_server:
+                    ip_bytes = nat.nat_outbound(ip_bytes)
+                    if ip_bytes is None:
+                        continue
+                
+                # --- 1. Increment & Protect the Sequence Counter ---
+                self.sequence_counter += 1
+                # Check for 64-bit overflow (Hard safety ceiling)
+                if self.sequence_counter > (1 << 64) - 1:
+                    raise RuntimeError("Sequence counter overflow! Crypto context exhausted. Keys must be rotated.")
+                
+                # Pack counter into 8 bytes (Big-Endian Unsigned Long Long)
+                counter_bytes = struct.pack(">Q", self.sequence_counter)
 
-            # 5. Build Full Protocol Payload
-            # The length header must represent ONLY the upcoming payload body size
-            payload_body = verify_hash + counter_bytes + encrypted_message_data
-            total_payload_length = len(payload_body)
-            
-            header_length_bytes = total_payload_length.to_bytes(4, byteorder="big")
-            
-            # Final Wire Combination Assembly: 
-            # [4B Length] + [8B Hash] + [8B Counter] + [16B IV] + [Ciphertext]
-            wire_packet = header_length_bytes + payload_body
+                # 2. Encrypt using AES-CBC (requires padding + dynamic 16-byte IV)
+                iv = os.urandom(16)
+                cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
+                padded_data = pad(ip_bytes, AES.block_size)
+                ciphertext = cipher.encrypt(padded_data)
 
-            self.black_connection.sendall(wire_packet)
-            print(f"[Red-to-Black] Framed and Sent packet #{self.sequence_counter}. Hex Hash Prefix: {verify_hash.hex()}")
+                # 3. Assemble the core message components
+                encrypted_message_data = iv + ciphertext
 
+                # 4. Generate verification token
+                # CRITICAL: We include counter_bytes in the hash. 
+                # This cryptographically locks the sequence number so attackers cannot alter it.
+                verify_input = self.key + counter_bytes + encrypted_message_data
+                verify_hash = hashlib.sha256(verify_input).digest()[:8]
+
+                # 5. Build Full Protocol Payload
+                # The length header must represent ONLY the upcoming payload body size
+                payload_body = verify_hash + counter_bytes + encrypted_message_data
+                total_payload_length = len(payload_body)
+                
+                header_length_bytes = total_payload_length.to_bytes(4, byteorder="big")
+                
+                # Final Wire Combination Assembly: 
+                # [4B Length] + [8B Hash] + [8B Counter] + [16B IV] + [Ciphertext]
+                wire_packet = header_length_bytes + payload_body
+
+                self.black_connection.sendall(wire_packet)
+                
+                self.red_sent_cnt += 1
+                self.bytes_counter += len(wire_packet)
+                self._stream_log("MGMT", f"Successfully delivered packet from red to black. ({len(wire_packet)} encrypted bytes).")
+
+            except Exception as e:
+                self.black_drop_cnt += 1
+                self._stream_log("PACKET_DROP", f"RED line: Exception while handling package encryption: {str(e)}.")
+    
     def black_to_red_loop(self):
         """
         Black → Red direction.
@@ -320,15 +382,15 @@ class Encryptor:
                 # receive_tcp_message reads the 4B length header and returns the rest
                 payload_received = encryptor_utils.receive_tcp_message(self.black_connection)
                 if payload_received is None:
-                    print("Received None. Connection likely dropped or invalid data.")
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", "BLACK line: Invalid TCP message length")
                     continue
-
-                print(f"\n--- Black→Red | {len(payload_received)} bytes wire payload ---")
 
                 # Protocol validation boundaries update:
                 # 8B Hash + 8B Counter + 16B IV + at least 16B ciphertext block = 48 bytes
                 if len(payload_received) < 48:
-                    print(f"[ALERT] Protocol violation! Packet too small ({len(payload_received)} bytes). Dropping.")
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", f"BLACK line: Packet size header too small ({len(payload_received)} bytes).")
                     continue
 
                 # --- 1. Slice and Parse Protocol Fields ---
@@ -343,13 +405,15 @@ class Encryptor:
                 # Drop early if it's explicitly too old or already recorded in the bitmask
                 # (We copy the check logic here before running expensive crypto routines)
                 if seq_num <= self.replay_window.max_seen - self.replay_window.window_size:
-                    print(f"[REPLAY ALERT] Packet #{seq_num} dropped: outside active window tail.")
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", "BLACK line: REPLAY, Packet #{seq_num} dropped: outside active window tail.")
                     continue
                 
                 if seq_num <= self.replay_window.max_seen:
                     bit_position = self.replay_window.max_seen - seq_num
                     if (self.replay_window.bitmap & (1 << bit_position)) != 0:
-                        print(f"[REPLAY ALERT] Duplicate packet #{seq_num} detected. Dropping.")
+                        self.black_drop_cnt += 1
+                        self._stream_log("PACKET_DROP", "BLACK line: REPLAY, Packet #{seq_num} dropped: Duplicate.")
                         continue
 
                 # --- 3. Validate Hash Integrity ---
@@ -358,7 +422,8 @@ class Encryptor:
                 calculated_hash = hashlib.sha256(verify_input).digest()[:8]
                 
                 if calculated_hash != provided_verify_hash:
-                    print("[ALERT] Cryptographic Verification Failed! Signature bad. Dropping.")
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", "BLACK line: Incorrect certificate.")
                     continue
 
                 # --- 4. Cryptographic Proof Obtained: Commit to Window ---
@@ -376,13 +441,16 @@ class Encryptor:
                 ip_bytes = unpad(encrypted_padded, AES.block_size)
 
                 if len(ip_bytes) > 1500:
-                    print("Decrypted IP payload exceeds MTU, dropping")
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", "BLACK line: Decrypted IP payload exceeds MTU.")
                     continue
 
                 # --- 6. Host: inbound NAT ---
                 if not self.is_server:
                     ip_bytes = nat.nat_inbound(ip_bytes)
                     if ip_bytes is None:
+                        self.black_drop_cnt += 1
+                        self._stream_log("PACKET_DROP", "BLACK line: Inbound NAT translation failed.")
                         continue
 
                 # --- 7. Resolve destination MAC ---
@@ -397,13 +465,20 @@ class Encryptor:
                     dst_mac, self.red_mac, IPV4_ETHERTYPE, ip_bytes)
 
                 if final_ethernet_frame is None:
-                    print("[Black-to-Red] Error building Ethernet frame.")
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", "BLACK line: Error building Ethernet frame.")
                     continue
 
                 print(f"[Black-to-Red] Success! Packet #{seq_num} processed cleanly. Forwarding to Red.")
                 self.red_socket.send(final_ethernet_frame)
+                
+                self.black_sent_cnt += 1
+                self.bytes_counter += len(final_ethernet_frame)
+                self._stream_log("MGMT", f"Successfully delivered packet from black to red. ({len(ip_bytes)} decrypted bytes, {len(final_ethernet_frame)} total bytes).")
 
             except ValueError:
-                print("[ALERT] Decryption Error: Padding is corrupted or wrong key used.")
+                self.black_drop_cnt += 1
+                self._stream_log("ALERT", "BLACK line: Decryption Error: Padding is corrupted or wrong key used.")
             except Exception as e:
-                print(f"[Black-to-Red] Unexpected Loop Error: {e}")
+                self.black_drop_cnt += 1
+                self._stream_log("ALERT", f"BLACK line: Exception while handling package decryption: {str(e)}.")
