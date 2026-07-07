@@ -66,6 +66,9 @@ class Encryptor:
 
         self.active = True
 
+        self.replay_window = encryptor_utils.ReplayWindow(window_size=64)
+        self.packet_counter = 0  # Initialize packet counter for sequence numbers
+
     # ──────────────────────────────────────
     # Helpers
     # ──────────────────────────────────────
@@ -219,7 +222,9 @@ class Encryptor:
         2. Handle ARP (respond locally, never tunnel ARP)
         3. Strip the Ethernet header to get clean IP bytes
         4. Host only: apply outbound NAT
-        5. Send the IP bytes over the encrypted tunnel
+        5. Increment sequence counter & encrypt using AES-CBC
+        6. Authenticate (Counter + IV + Ciphertext) to prevent replay
+        7. Send the packet over the encrypted tunnel
         """
         while self.active:
             packet_data, _address = self.red_socket.recvfrom(65535)
@@ -227,6 +232,7 @@ class Encryptor:
             # --- Parse Ethernet header ---
             parsed = parse_ethernet_header(packet_data)
             if parsed is None:
+                # Assuming parse_ethernet_header is defined elsewhere
                 continue
             dst_mac, src_mac, ethertype, ip_bytes = parsed
 
@@ -259,110 +265,143 @@ class Encryptor:
                     continue
 
             print("Encrypting IP Bytes")
-            # 1. Encrypt using AES-CBC (requires padding + dynamic 16-byte IV)
+            
+            # --- 1. Increment & Protect the Sequence Counter ---
+            self.sequence_counter += 1
+            # Check for 64-bit overflow (Hard safety ceiling)
+            if self.sequence_counter > (1 << 64) - 1:
+                raise RuntimeError("Sequence counter overflow! Crypto context exhausted. Keys must be rotated.")
+            
+            # Pack counter into 8 bytes (Big-Endian Unsigned Long Long)
+            counter_bytes = struct.pack(">Q", self.sequence_counter)
+
+            # 2. Encrypt using AES-CBC (requires padding + dynamic 16-byte IV)
             iv = os.urandom(16)
             cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
             padded_data = pad(ip_bytes, AES.block_size)
             ciphertext = cipher.encrypt(padded_data)
 
-            # 2. Assemble into the "Message Data" array block (IV + Ciphertext)
+            # 3. Assemble the core message components
             encrypted_message_data = iv + ciphertext
 
-            # 3. Generate verification token: hash(key + message_data) -> exactly 8 bytes
-            verify_input = self.key + encrypted_message_data
+            # 4. Generate verification token
+            # CRITICAL: We include counter_bytes in the hash. 
+            # This cryptographically locks the sequence number so attackers cannot alter it.
+            verify_input = self.key + counter_bytes + encrypted_message_data
             verify_hash = hashlib.sha256(verify_input).digest()[:8]
 
-            print("hash added", verify_hash)
-
-            # 4. Build Full Protocol Payload
+            # 5. Build Full Protocol Payload
             # The length header must represent ONLY the upcoming payload body size
-            payload_body = verify_hash + encrypted_message_data
+            payload_body = verify_hash + counter_bytes + encrypted_message_data
             total_payload_length = len(payload_body)
             
             header_length_bytes = total_payload_length.to_bytes(4, byteorder="big")
             
-            # Final Wire Combination Assembly: [4B Length] + [8B Hash] + [IV + Ciphertext]
+            # Final Wire Combination Assembly: 
+            # [4B Length] + [8B Hash] + [8B Counter] + [16B IV] + [Ciphertext]
             wire_packet = header_length_bytes + payload_body
 
             self.black_connection.sendall(wire_packet)
-            print(f"[Red-to-Black] Framed and Sent packet. Hex Hash Prefix: {verify_hash.hex()}")
+            print(f"[Red-to-Black] Framed and Sent packet #{self.sequence_counter}. Hex Hash Prefix: {verify_hash.hex()}")
 
     def black_to_red_loop(self):
         """
         Black → Red direction.
 
-        1. Receive IP bytes from the encrypted tunnel
-        2. Host only: apply inbound NAT
-        3. Resolve the destination MAC via ARP cache
-        4. Build a new Ethernet frame (our MAC as source)
-        5. Inject the frame onto the red NIC
+        1. Receive raw protocol payload from the encrypted tunnel
+        2. Unpack sequence counter and run sliding window pre-check
+        3. Cryptographically verify hash integrity (prevents counter tampering)
+        4. Commit sequence number permanently to the sliding window bitmask
+        5. Decrypt payload and strip padding securely
+        6. Forward clean IP bytes to the Red NIC via Ethernet frame insertion
         """
         while self.active:
             try:
+                # receive_tcp_message reads the 4B length header and returns the rest
                 payload_received = encryptor_utils.receive_tcp_message(self.black_connection)
                 if payload_received is None:
                     print("Received None. Connection likely dropped or invalid data.")
                     continue
 
-                print(f"\n--- Black→Red | {len(payload_received)} bytes IP payload ---")
+                print(f"\n--- Black→Red | {len(payload_received)} bytes wire payload ---")
 
-                
-
-                if payload_received is None:
-                    print("[Black-to-Red] Error: Connection dropped or empty message.")
-                    continue
-
-                # 2. Check protocol length boundaries (8 bytes verification + 16 bytes IV + at least 16 bytes ciphertext block)
-                if len(payload_received) < 40:
+                # Protocol validation boundaries update:
+                # 8B Hash + 8B Counter + 16B IV + at least 16B ciphertext block = 48 bytes
+                if len(payload_received) < 48:
                     print(f"[ALERT] Protocol violation! Packet too small ({len(payload_received)} bytes). Dropping.")
                     continue
 
-                # 3. Parse fields directly from the payload payload
+                # --- 1. Slice and Parse Protocol Fields ---
                 provided_verify_hash = payload_received[0:8]
-                message_data = payload_received[8:]
+                counter_bytes        = payload_received[8:16]
+                message_data         = payload_received[16:]  # Contains [IV + Ciphertext]
 
-                # 4. Validate Custom Hash Verification: hash(key + message_data) using first 8 bytes
-                verify_input = self.key + message_data
+                # Unpack the raw bytes back into an integer
+                seq_num = struct.unpack(">Q", counter_bytes)[0]
+
+                # --- 2. Sliding Window Pre-Check ---
+                # Drop early if it's explicitly too old or already recorded in the bitmask
+                # (We copy the check logic here before running expensive crypto routines)
+                if seq_num <= self.replay_window.max_seen - self.replay_window.window_size:
+                    print(f"[REPLAY ALERT] Packet #{seq_num} dropped: outside active window tail.")
+                    continue
+                
+                if seq_num <= self.replay_window.max_seen:
+                    bit_position = self.replay_window.max_seen - seq_num
+                    if (self.replay_window.bitmap & (1 << bit_position)) != 0:
+                        print(f"[REPLAY ALERT] Duplicate packet #{seq_num} detected. Dropping.")
+                        continue
+
+                # --- 3. Validate Hash Integrity ---
+                # We hash key + counter + message_data to ensure the counter wasn't modified
+                verify_input = self.key + counter_bytes + message_data
                 calculated_hash = hashlib.sha256(verify_input).digest()[:8]
                 
                 if calculated_hash != provided_verify_hash:
-                    print("provided hash", provided_verify_hash)
-                    print("[ALERT] Verification Failed! Signature bad. Dropping.")
+                    print("[ALERT] Cryptographic Verification Failed! Signature bad. Dropping.")
                     continue
 
-                # 5. Separate IV and Ciphertext out of the remaining message data block
+                # --- 4. Cryptographic Proof Obtained: Commit to Window ---
+                # Now that we know the packet is authentic and fresh, safe to update/slide the window
+                self.replay_window.verify_and_update(seq_num)
+
+                # --- 5. Decrypt Payload Content ---
                 iv = message_data[:16]
                 ciphertext = message_data[16:]
 
-                # 6. Decrypt using AES-CBC
                 cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
                 encrypted_padded = cipher.decrypt(ciphertext)
                 
                 # Strip PKCS7 padding securely
                 ip_bytes = unpad(encrypted_padded, AES.block_size)
 
-                print(f"[Black-to-Red] Success! Packet verified & decrypted. Forwarding {len(ip_bytes)} bytes to Red. - {message_data} = {ip_bytes}")
                 if len(ip_bytes) > 1500:
-                    print("IP payload exceeds MTU, dropping")
+                    print("Decrypted IP payload exceeds MTU, dropping")
                     continue
 
-                # --- Host: inbound NAT ---
+                # --- 6. Host: inbound NAT ---
                 if not self.is_server:
                     ip_bytes = nat.nat_inbound(ip_bytes)
                     if ip_bytes is None:
                         continue
 
-                # --- Resolve destination MAC ---
+                # --- 7. Resolve destination MAC ---
                 if len(ip_bytes) >= 20:
                     dst_ip = socket.inet_ntoa(ip_bytes[16:20])
                     dst_mac = self._resolve_mac(dst_ip)
                 else:
                     dst_mac = BROADCAST_MAC
 
-            # --- Rebuild Ethernet frame and inject onto the red NIC ---
-                to_send_packet = build_ethernet_frame(
+                # --- 8. Rebuild Ethernet frame and inject onto the red NIC ---
+                final_ethernet_frame = build_ethernet_frame(
                     dst_mac, self.red_mac, IPV4_ETHERTYPE, ip_bytes)
-                self.red_socket.send(to_send_packet)
+
+                if final_ethernet_frame is None:
+                    print("[Black-to-Red] Error building Ethernet frame.")
+                    continue
+
+                print(f"[Black-to-Red] Success! Packet #{seq_num} processed cleanly. Forwarding to Red.")
+                self.red_socket.send(final_ethernet_frame)
 
             except ValueError:
                 print("[ALERT] Decryption Error: Padding is corrupted or wrong key used.")
