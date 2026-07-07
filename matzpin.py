@@ -79,7 +79,7 @@ class Encryptor:
         if sys.platform.startswith('win'):
             self.log_file_path = "matzpin.log"
         else:
-            self.log_file_path = "/var/log/matzpin.log"
+            self.log_file_path = "/home/matzpin/matzpin.log"
 
     # ──────────────────────────────────────
     # Network helpers
@@ -469,12 +469,11 @@ class Encryptor:
                     self._stream_log("PACKET_DROP", "BLACK line: Error building Ethernet frame.")
                     continue
 
-                print(f"[Black-to-Red] Success! Packet #{seq_num} processed cleanly. Forwarding to Red.")
                 self.red_socket.send(final_ethernet_frame)
                 
                 self.black_sent_cnt += 1
                 self.bytes_counter += len(final_ethernet_frame)
-                self._stream_log("MGMT", f"Successfully delivered packet from black to red. ({len(ip_bytes)} decrypted bytes, {len(final_ethernet_frame)} total bytes).")
+                self._stream_log("MGMT", f"Successfully delivered packet from black to red. ({len(final_ethernet_frame)} frame bytes).")
 
             except ValueError:
                 self.black_drop_cnt += 1
