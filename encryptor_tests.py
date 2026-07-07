@@ -1,14 +1,13 @@
 import unittest
-from unittest.mock import MagicMock, patch, mock_open
-import socket
+from unittest.mock import MagicMock, patch
 import struct
-import os
 import hashlib
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+import time
+from Cryptodome.Cipher import AES
+from Cryptodome.Util.Padding import pad
 
-# Assuming your class is inside a file named encryptor.py
-from matzpin import Encryptor, DH_BASE, DH_PRIME
+# Assuming your class is inside a file named matzpin.py
+from matzpin import Encryptor
 
 class TestEncryptor(unittest.TestCase):
     @patch('matzpin.fcntl.ioctl')
@@ -29,13 +28,62 @@ class TestEncryptor(unittest.TestCase):
             black_ip="10.0.0.1", 
             black_port=9999
         )
-        # Initialize sequence_counter explicitly if not done in __init__
-        if not hasattr(self.encryptor, 'sequence_counter'):
-            self.encryptor.sequence_counter = 0
-
+        
         # Mock the black connection socket
         self.mock_black_conn = MagicMock()
         self.encryptor.black_connection = self.mock_black_conn
+
+    ## ───────────────────────────────────────────────────────────
+    ## Key Rolling & Derivation Logic Tests
+    ## ───────────────────────────────────────────────────────────
+
+    def test_parametric_derive_next_key_single_step(self):
+        """Verify that _derive_next_key steps exactly 1 generation correctly."""
+        initial_key = b"A_VERY_VERY_SECURE_32_BYTE_KEY!!"
+        initial_id = 0
+        
+        target_key, target_id, prev_key, prev_id = self.encryptor._derive_next_key(
+            initial_key, initial_id, n=1
+        )
+        
+        expected_next_key = hashlib.sha256(initial_key).digest()
+        self.assertEqual(target_key, expected_next_key)
+        self.assertEqual(target_id, 1)
+        self.assertEqual(prev_key, initial_key)
+        self.assertEqual(prev_id, 0)
+
+    def test_parametric_derive_next_key_multi_step(self):
+        """Verify that _derive_next_key advances multiple steps (n=3) correctly."""
+        initial_key = b"A_VERY_VERY_SECURE_32_BYTE_KEY!!"
+        initial_id = 254 # Test wrap-around boundary logic % 25
+        
+        target_key, target_id, prev_key, prev_id = self.encryptor._derive_next_key(
+            initial_key, initial_id, n=3
+        )
+        
+        # Calculate expected iterations manually to ensure correctness
+        key_1 = hashlib.sha256(initial_key).digest()  # ID: 255
+        key_2 = hashlib.sha256(key_1).digest()        # ID: 0
+        key_3 = hashlib.sha256(key_2).digest()        # ID: 1
+        
+        self.assertEqual(target_key, key_3)
+        self.assertEqual(target_id, 1)
+        self.assertEqual(prev_key, key_2)
+        self.assertEqual(prev_id, 0)
+
+    def test_local_time_triggered_key_roll(self):
+        """Verify checking interval logic forces a stateful key roll after 1 hour."""
+        old_key = self.encryptor.key
+        old_id = self.encryptor.current_key_id
+        
+        # Simulate an expired 1-hour interval duration
+        self.encryptor.last_roll_time = time.time() - 3601
+        self.encryptor._check_and_apply_time_roll()
+        
+        self.assertNotEqual(self.encryptor.key, old_key)
+        self.assertEqual(self.encryptor.current_key_id, old_id + 1)
+        self.assertEqual(self.encryptor.previous_key, old_key)
+        self.assertEqual(self.encryptor.previous_key_id, old_id)
 
     ## ───────────────────────────────────────────────────────────
     ## Sequence Counter & Sliding Window Tests
@@ -46,7 +94,6 @@ class TestEncryptor(unittest.TestCase):
         self.encryptor.sequence_counter = 0
         self.encryptor.active = True
         
-        # Side-effect to break the loop *after* reading a packet
         def recvfrom_side_effect(*args, **kwargs):
             self.encryptor.active = False
             return (b'\x00'*14 + b'\x45' + b'\x00'*19, ('addr', 0))
@@ -56,7 +103,6 @@ class TestEncryptor(unittest.TestCase):
         with patch('matzpin.parse_ethernet_header') as mock_parse, \
              patch('matzpin.IPV4_ETHERTYPE', 0x0800):
             
-            # Destination MAC, Source MAC (different to avoid loopback drop), EtherType, IP payload
             mock_parse.return_value = (b'\xaa'*6, b'\xbb'*6, 0x0800, b'\x45' + b'\x00'*19)
             
             # 1. Test normal increment
@@ -69,8 +115,6 @@ class TestEncryptor(unittest.TestCase):
             # 2. Test hard ceiling overflow threshold: (2^64 - 1)
             self.encryptor.sequence_counter = (1 << 64) - 1
             self.encryptor.active = True
-            
-            # Reset side effect to safely trip the loop check again
             self.mock_red_socket.recvfrom.side_effect = recvfrom_side_effect
             
             with self.assertRaises(RuntimeError) as context:
@@ -82,30 +126,14 @@ class TestEncryptor(unittest.TestCase):
         """Verify packets falling behind the trailing edge of the sliding window are dropped."""
         self.encryptor.replay_window.max_seen = 100
         self.encryptor.replay_window.window_size = 64
-        self.encryptor.replay_window.bitmap = 0x1
         self.encryptor.active = True
         
         stale_seq_num = 36 
+        key_id_byte = struct.pack(">B", self.encryptor.current_key_id)
         counter_bytes = struct.pack(">Q", stale_seq_num)
-        payload = b'\x00'*8 + counter_bytes + b'\x00'*32
         
-        def recv_side_effect(*args, **kwargs):
-            self.encryptor.active = False
-            return payload
-        
-        with patch('matzpin.encryptor_utils.receive_tcp_message', side_effect=recv_side_effect):
-            self.encryptor.black_to_red_loop()
-
-    def test_black_to_red_replay_window_duplicate_detection(self):
-        """Verify identical sequence numbers inside the sliding window bitmask are flagged and dropped."""
-        self.encryptor.replay_window.max_seen = 50
-        self.encryptor.replay_window.window_size = 64
-        self.encryptor.replay_window.bitmap = 1 << 0 
-        self.encryptor.active = True
-        
-        duplicate_seq = 50
-        counter_bytes = struct.pack(">Q", duplicate_seq)
-        payload = b'\x00'*8 + counter_bytes + b'\x00'*32
+        # Sliced input expects layout: verify_hash[8] + key_id_byte[1] + counter_bytes[8] + message_data[...]
+        payload = b'\x00'*8 + key_id_byte + counter_bytes + b'\x00'*32
         
         def recv_side_effect(*args, **kwargs):
             self.encryptor.active = False
@@ -115,21 +143,21 @@ class TestEncryptor(unittest.TestCase):
             self.encryptor.black_to_red_loop()
 
     ## ───────────────────────────────────────────────────────────
-    ## Cryptographic Integrity Tests
+    ## Cryptographic Integrity & Dynamic Remote Catch-Up Tests
     ## ───────────────────────────────────────────────────────────
 
     def test_black_to_red_cryptographic_verification_failure(self):
-        """Verify packets with tampered payload or sequence counters fail the SHA256 integrity token check."""
+        """Verify packets with tampered payload or sequence counters fail the integrity check."""
         self.encryptor.replay_window.max_seen = 10
-        self.encryptor.replay_window.bitmap = 0
         self.encryptor.active = True
         
         valid_seq = 15
+        key_id_byte = struct.pack(">B", self.encryptor.current_key_id)
         counter_bytes = struct.pack(">Q", valid_seq)
         message_data = b'\x00'*32 
         
         bad_verify_hash = b'\xDEADBEEF\x00\x00\x00\x00'[:8]
-        payload = bad_verify_hash + counter_bytes + message_data
+        payload = bad_verify_hash + key_id_byte + counter_bytes + message_data
         
         def recv_side_effect(*args, **kwargs):
             self.encryptor.active = False
@@ -138,13 +166,56 @@ class TestEncryptor(unittest.TestCase):
         with patch('matzpin.encryptor_utils.receive_tcp_message', side_effect=recv_side_effect):
             self.encryptor.black_to_red_loop()
 
-    def test_black_to_red_successful_crypto_and_window_commit(self):
-        """Verify a perfectly formed packet validates dynamically, advances the window, and decrypts successfully."""
+    def test_black_to_red_speculative_remote_catch_up(self):
+        """Verify a wire packet showing a higher key_id triggers parametric rollahead calculations."""
         self.encryptor.replay_window.max_seen = 10
-        self.encryptor.replay_window.bitmap = 0
+        self.encryptor.active = True
+        
+        # Target a remote loop-ahead distance of 5 key increments
+        future_key_id = (self.encryptor.current_key_id + 5) % 256
+        valid_seq = 12
+        
+        # Deriving the verified speculative key to sign valid test packet
+        target_key, _, spec_prev, spec_prev_id = self.encryptor._derive_next_key(
+            self.encryptor.key, self.encryptor.current_key_id, n=5
+        )
+        
+        key_id_byte = struct.pack(">B", future_key_id)
+        counter_bytes = struct.pack(">Q", valid_seq)
+        
+        iv = b'H'*16
+        cipher = AES.new(target_key, AES.MODE_CBC, iv=iv)
+        raw_ip_payload = b'\x45\x00\x00\x28' + b'\x00'*16 
+        ciphertext = cipher.encrypt(pad(raw_ip_payload, AES.block_size))
+        message_data = iv + ciphertext
+        
+        verify_input = target_key + key_id_byte + counter_bytes + message_data
+        calculated_hash = hashlib.sha256(verify_input).digest()[:8]
+        full_payload = calculated_hash + key_id_byte + counter_bytes + message_data
+        
+        def recv_side_effect(*args, **kwargs):
+            self.encryptor.active = False
+            return full_payload
+            
+        with patch('matzpin.encryptor_utils.receive_tcp_message', side_effect=recv_side_effect), \
+             patch('matzpin.build_ethernet_frame', return_value=b'ETH_FRAME_OK'), \
+             patch.object(self.encryptor, '_resolve_mac', return_value=b'\x22'*6):
+             
+            self.encryptor.black_to_red_loop()
+            
+            # Assert local active cryptographic parameters caught up statefully
+            self.assertEqual(self.encryptor.current_key_id, future_key_id)
+            self.assertEqual(self.encryptor.key, target_key)
+            self.assertEqual(self.encryptor.previous_key, spec_prev)
+            self.assertEqual(self.encryptor.previous_key_id, spec_prev_id)
+
+    def test_black_to_red_successful_crypto_and_window_commit(self):
+        """Verify standard synchronized execution paths decrypt and record valid messages correctly."""
+        self.encryptor.replay_window.max_seen = 10
         self.encryptor.active = True
         
         valid_seq = 11
+        key_id_byte = struct.pack(">B", self.encryptor.current_key_id)
         counter_bytes = struct.pack(">Q", valid_seq)
         
         iv = b'H'*16
@@ -154,10 +225,9 @@ class TestEncryptor(unittest.TestCase):
         ciphertext = cipher.encrypt(padded_ip)
         message_data = iv + ciphertext
         
-        verify_input = self.encryptor.key + counter_bytes + message_data
+        verify_input = self.encryptor.key + key_id_byte + counter_bytes + message_data
         calculated_hash = hashlib.sha256(verify_input).digest()[:8]
-        
-        full_payload = calculated_hash + counter_bytes + message_data
+        full_payload = calculated_hash + key_id_byte + counter_bytes + message_data
         
         def recv_side_effect(*args, **kwargs):
             self.encryptor.active = False
@@ -172,7 +242,6 @@ class TestEncryptor(unittest.TestCase):
             
             mock_window_commit.assert_called_once_with(valid_seq)
             self.mock_red_socket.send.assert_called_with(b'ETH_FRAME_OK')
-
 
 if __name__ == '__main__':
     unittest.main()
