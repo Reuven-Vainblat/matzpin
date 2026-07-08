@@ -17,11 +17,7 @@ def receive_tcp_message(sock):
     try:
         # 1. Read the 4-byte integer header to find out the payload size
         header = receive_exact_bytes(sock, 4)
-        print("RECIVE TCP MSG HEADER", header)
         message_length = int.from_bytes(header, byteorder="big")
-        
-        # Add a debug print to see what is actually coming over the wire
-        print(f"[DEBUG] Parsed message length: {message_length} bytes (Header raw: {header})")
 
         # 2. Sanity check the size before receiving the payload
         if message_length > MAX_PAYLOAD_SIZE:

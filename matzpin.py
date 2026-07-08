@@ -56,11 +56,20 @@ class Encryptor:
 
         # Retrieve our own MAC from the NIC
         self.red_mac = self._get_nic_mac(red_nic)
-        print(f"[Init] Red NIC '{red_nic}' MAC: {self.red_mac.hex(':')}")
-        print(f"[Init] Red IP: {red_ip}  |  Mode: {'server' if is_server else 'host'}")
+
+        # Subnet and gateway info for routing decisions
+        self.red_netmask = self._get_nic_netmask(red_nic)
+        self.red_gateway = self._get_default_gateway(red_nic)
 
         # ARP table for red-side MAC resolution
         self.arp_table = ArpTable()
+
+        # IPs this encryptor should claim on the red network via ARP
+        self.arp_respond_ips = {self.red_ip}
+        if self.is_server:
+            # Server must also claim the host's NAT external IP
+            # so return traffic is routed to our NIC and tunneled back
+            self.arp_respond_ips.add(nat.EXTERNAL_IP)
 
         self.key = b"A_VERY_VERY_SECURE_32_BYTE_KEY!!"  
 
@@ -82,6 +91,48 @@ class Encryptor:
         finally:
             s.close()
         return bytes(info[18:24])
+
+    @staticmethod
+    def _get_nic_netmask(nic_name):
+        """Read the subnet mask of a network interface via ioctl.
+        Returns None if the NIC has no IP address assigned."""
+        SIOCGIFNETMASK = 0x891b
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            info = fcntl.ioctl(
+                s.fileno(), SIOCGIFNETMASK,
+                struct.pack('256s', nic_name.encode()[:15]))
+            return bytes(info[20:24])
+        except OSError:
+            return None
+        finally:
+            s.close()
+
+    @staticmethod
+    def _get_default_gateway(nic_name):
+        """Read the default gateway for a NIC from /proc/net/route."""
+        try:
+            with open('/proc/net/route', 'r') as f:
+                for line in f:
+                    fields = line.strip().split()
+                    if len(fields) >= 3 and fields[0] == nic_name and fields[1] == '00000000':
+                        # /proc/net/route stores IPs as hex in host byte order
+                        # Pack as native-order int, giving network-order bytes for inet_ntoa
+                        gw_bytes = struct.pack('=I', int(fields[2], 16))
+                        return socket.inet_ntoa(gw_bytes)
+        except (OSError, IOError):
+            pass
+        return None
+
+    def _is_local_ip(self, ip):
+        """Check whether an IP address is on the red NIC's local subnet.
+        Returns True (assume local) if subnet info is unavailable."""
+        if self.red_netmask is None:
+            return True
+        ip_int = struct.unpack('!I', socket.inet_aton(ip))[0]
+        my_ip_int = struct.unpack('!I', socket.inet_aton(self.red_ip))[0]
+        mask_int = struct.unpack('!I', self.red_netmask)[0]
+        return (ip_int & mask_int) == (my_ip_int & mask_int)
 
     # ──────────────────────────────────────
     # Black-side connection setup
@@ -118,8 +169,6 @@ class Encryptor:
         print("[Sender] Connected successfully.")
 
     def sync_keys(self):
-        print("[KeySync] Starting Diffie-Hellman Key Exchange...")
-
         private_key = secrets.randbits(256)
 
         # pow(base, exponent, modulus)* 
@@ -142,8 +191,6 @@ class Encryptor:
 
         # using sha256 to create a equalized key for encryption
         self.key = hashlib.sha256(shared_secret_bytes).digest()
-        
-        print(f"[KeySync] Key exchange successful. Derived Key (Hex): {self.key.hex()}")
 
     # ──────────────────────────────────────
     # ARP handling on the red side
@@ -168,11 +215,6 @@ class Encryptor:
 
         # Learn the sender
         self.arp_table.update(arp['sender_ip'], arp['sender_mac'])
-        
-        if arp['opcode'] == ARP_REQUEST:
-            print(f"[ARP] {arp['sender_ip']} is asking: Who has {arp['target_ip']}?")
-        elif arp['opcode'] == ARP_REPLY:
-            print(f"[ARP] Learned {arp['sender_ip']} -> {arp['sender_mac'].hex(':')}")
 
         # Reply if it's asking for our IP, OR if we are the host (Proxy ARP for everything else)
         if arp['opcode'] == ARP_REQUEST:
@@ -180,11 +222,10 @@ class Encryptor:
             if arp['target_ip'] == arp['sender_ip']:
                 return None
                 
-            if arp['target_ip'] == self.red_ip or not self.is_server:
+            if arp['target_ip'] in self.arp_respond_ips or not self.is_server:
                 reply = build_arp_reply(
                     self.red_mac, arp['target_ip'], # Claim to be the requested IP
                     arp['sender_mac'], arp['sender_ip'])
-                print(f"[ARP] Replying: {arp['target_ip']} is-at {self.red_mac.hex(':')}")
                 return reply
 
         return None
@@ -192,18 +233,24 @@ class Encryptor:
     def _resolve_mac(self, dst_ip):
         """Resolve an IP to a MAC via the ARP cache.
 
+        If the destination is outside the local subnet, resolves the
+        default gateway's MAC instead (so the gateway can route it).
         If the mapping is unknown an ARP request is sent and broadcast
-        is returned as a temporary fallback (the reply will populate the
-        cache for the next packet).
+        is returned as a temporary fallback.
         """
-        mac = self.arp_table.lookup(dst_ip)
+        # For non-local IPs, route through the gateway
+        if not self._is_local_ip(dst_ip) and self.red_gateway:
+            resolve_ip = self.red_gateway
+        else:
+            resolve_ip = dst_ip
+
+        mac = self.arp_table.lookup(resolve_ip)
         if mac is not None:
             return mac
 
-        # Send an ARP who-has for this IP
-        arp_req = build_arp_request(self.red_mac, self.red_ip, dst_ip)
+        # Send an ARP who-has for the target (or gateway)
+        arp_req = build_arp_request(self.red_mac, self.red_ip, resolve_ip)
         self.red_socket.send(arp_req)
-        print(f"[ARP] Sent who-has for {dst_ip}")
 
         return BROADCAST_MAC  # fallback until we learn the real MAC
 
@@ -230,6 +277,7 @@ class Encryptor:
                 continue
             dst_mac, src_mac, ethertype, ip_bytes = parsed
 
+
             # Ignore frames that we sent ourselves (loopback)
             if src_mac == self.red_mac:
                 continue
@@ -245,20 +293,17 @@ class Encryptor:
             if ethertype != IPV4_ETHERTYPE:
                 continue
 
-            # Learn the source MAC from this frame while we have it
             if len(ip_bytes) >= 20:
                 src_ip = socket.inet_ntoa(ip_bytes[12:16])
                 self.arp_table.update(src_ip, src_mac)
+            
 
-            print(f"\n--- Red→Black | {len(ip_bytes)} bytes IP payload ---")
 
             # --- Host: outbound NAT on the clean IP bytes ---
             if not self.is_server:
                 ip_bytes = nat.nat_outbound(ip_bytes)
                 if ip_bytes is None:
                     continue
-
-            print("Encrypting IP Bytes")
             # 1. Encrypt using AES-CBC (requires padding + dynamic 16-byte IV)
             iv = os.urandom(16)
             cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
@@ -272,8 +317,6 @@ class Encryptor:
             verify_input = self.key + encrypted_message_data
             verify_hash = hashlib.sha256(verify_input).digest()[:8]
 
-            print("hash added", verify_hash)
-
             # 4. Build Full Protocol Payload
             # The length header must represent ONLY the upcoming payload body size
             payload_body = verify_hash + encrypted_message_data
@@ -285,7 +328,6 @@ class Encryptor:
             wire_packet = header_length_bytes + payload_body
 
             self.black_connection.sendall(wire_packet)
-            print(f"[Red-to-Black] Framed and Sent packet. Hex Hash Prefix: {verify_hash.hex()}")
 
     def black_to_red_loop(self):
         """
@@ -302,9 +344,7 @@ class Encryptor:
                 payload_received = encryptor_utils.receive_tcp_message(self.black_connection)
                 if payload_received is None:
                     print("Received None. Connection likely dropped or invalid data.")
-                    continue
-
-                print(f"\n--- Black→Red | {len(payload_received)} bytes IP payload ---")
+                    self.active = False
 
                 
 
@@ -326,7 +366,6 @@ class Encryptor:
                 calculated_hash = hashlib.sha256(verify_input).digest()[:8]
                 
                 if calculated_hash != provided_verify_hash:
-                    print("provided hash", provided_verify_hash)
                     print("[ALERT] Verification Failed! Signature bad. Dropping.")
                     continue
 
@@ -340,9 +379,7 @@ class Encryptor:
                 
                 # Strip PKCS7 padding securely
                 ip_bytes = unpad(encrypted_padded, AES.block_size)
-
-                print(f"[Black-to-Red] Success! Packet verified & decrypted. Forwarding {len(ip_bytes)} bytes to Red. - {message_data} = {ip_bytes}")
-                if len(ip_bytes) > 1500:
+                if len(ip_bytes) > 2500:
                     print("IP payload exceeds MTU, dropping")
                     continue
 
@@ -358,6 +395,8 @@ class Encryptor:
                     dst_mac = self._resolve_mac(dst_ip)
                 else:
                     dst_mac = BROADCAST_MAC
+
+
 
             # --- Rebuild Ethernet frame and inject onto the red NIC ---
                 to_send_packet = build_ethernet_frame(

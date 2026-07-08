@@ -2,7 +2,7 @@ import time
 import socket
 import struct
 
-EXTERNAL_IP = "10.60.44.6"
+EXTERNAL_IP = "10.60.44.23"
 TIMEOUT = 30  # seconds
 
 # NAT_TABLE: (src_ip, src_port) -> {'port': ext_port, 'last_seen': time.time()}
@@ -46,6 +46,7 @@ def allocate_port(src_ip, src_port):
         now = time.time()
         NAT_TABLE[(src_ip, src_port)] = {'port': ext_port, 'last_seen': now}
         REVERSE_TABLE[ext_port] = ((src_ip, src_port), now)
+        print(f"[NAT] New port allocation: {src_ip}:{src_port} -> {EXTERNAL_IP}:{ext_port}")
         NEXT_PORT = 40000 + ((NEXT_PORT - 40000 + 1) % 20000)
     else:
         NAT_TABLE[(src_ip, src_port)]['last_seen'] = time.time()
@@ -127,7 +128,6 @@ def nat_outbound(ip_bytes: bytes) -> bytes:
         return ip_bytes  # Pass through non-NATtable packets
 
     version, ihl, protocol, l4_offset, src_ip, dst_ip, src_port, dst_port = parsed
-    print(f"[NAT OUT] {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
 
     pkt = bytearray(ip_bytes)
 
@@ -151,7 +151,6 @@ def nat_inbound(ip_bytes: bytes) -> bytes | None:
         return ip_bytes  # Pass through non-NATtable packets
 
     version, ihl, protocol, l4_offset, src_ip, dst_ip, src_port, dst_port = parsed
-    print(f"[NAT IN] {src_ip}:{src_port} -> {dst_ip}:{dst_port}")
 
     if dst_ip != EXTERNAL_IP:
         return ip_bytes  # Not addressed to us, pass through
@@ -159,7 +158,7 @@ def nat_inbound(ip_bytes: bytes) -> bytes | None:
     cleanup_expired()
 
     if dst_port not in REVERSE_TABLE:
-        print(f"[NAT IN] No mapping for port {dst_port}, dropping")
+        #print(f"[NAT IN] Error: No mapping for port {dst_port}, dropping")
         return None  # Drop — no mapping
 
     (internal_ip, internal_port), _ = REVERSE_TABLE[dst_port]
