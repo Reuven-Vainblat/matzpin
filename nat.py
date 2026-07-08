@@ -186,7 +186,7 @@ def handle_packet_bytes(packet_bytes: bytes) -> bytes | None:
 
     _, _, _, _, _, dst_ip, _, dst_port = parsed
 
-    print("Got packet to", dst_ip, dst_port)
+    #print("Got packet to", dst_ip, dst_port)
 
     if dst_ip == EXTERNAL_IP:
         return nat_inbound(packet_bytes)

@@ -7,8 +7,10 @@ from Cryptodome.Cipher import AES
 from Cryptodome.Util.Padding import pad, unpad
 import encryptor_utils
 import secrets
-import hashlib
 import os
+import sys
+import json
+import time
 
 from arp_handler import (
     ArpTable, parse_ethernet_header, build_ethernet_frame,
@@ -19,11 +21,7 @@ from arp_handler import (
 
 ETH_P_ALL = 3  # read all protocols
 
-
-# Base (Generator)
 DH_BASE = 2
-
-# Prime Modulus (p)
 DH_PRIME = int(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
@@ -35,13 +33,12 @@ DH_PRIME = int(
     "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
     "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
     "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
-    "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF",
     16
 )
 
 class Encryptor:
     def __init__(self, is_server, red_nic, red_ip, black_ip, black_port=9999):
-
         self.is_server = is_server
         self.red_nic = red_nic
         self.red_ip = red_ip
@@ -54,7 +51,6 @@ class Encryptor:
             socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
         self.red_socket.bind((red_nic, 0))
 
-        # Retrieve our own MAC from the NIC
         self.red_mac = self._get_nic_mac(red_nic)
 
         # Subnet and gateway info for routing decisions
@@ -71,12 +67,109 @@ class Encryptor:
             # so return traffic is routed to our NIC and tunneled back
             self.arp_respond_ips.add(nat.EXTERNAL_IP)
 
-        self.key = b"A_VERY_VERY_SECURE_32_BYTE_KEY!!"  
+        # --- Key Rolling Management State ---
+        self.current_key_id = 0
+        self.key = b"A_VERY_VERY_SECURE_32_BYTE_KEY!!"
+        self.previous_key = None              # Kept for grace period compatibility
+        self.previous_key_id = None           # Tracks the ID of the fallback key
+        self.last_roll_time = time.time()
 
         self.active = True
+        self.replay_window = encryptor_utils.ReplayWindow(window_size=64)
+        self.sequence_counter = 0
+
+        self.red_sent_cnt = 0
+        self.red_drop_cnt = 0
+        self.black_sent_cnt = 0
+        self.black_drop_cnt = 0
+        self.bytes_counter = 0
+
+        if sys.platform.startswith('win'):
+            self.log_file_path = "matzpin.log"
+        else:
+            self.log_file_path = "/home/matzpin/matzpin.log"
 
     # ──────────────────────────────────────
-    # Helpers
+    # N-Step Parametric Key Rolling Logic
+    # ──────────────────────────────────────
+
+    def _derive_next_key(self, current_key, current_key_id, n=1):
+        """Generic function to roll forward n generations.
+        Returns (target_key, target_key_id, intermediate_prev_key, intermediate_prev_key_id).
+        """
+        check_key = current_key
+        temp_id = current_key_id
+        temp_prev = None
+        temp_prev_id = None
+
+        for _ in range(n):
+            temp_prev = check_key
+            temp_prev_id = temp_id
+            check_key = hashlib.sha256(check_key).digest()
+            temp_id = (temp_id + 1) % 256
+
+        return check_key, temp_id, temp_prev, temp_prev_id
+
+    def _roll_key_local(self):
+        """Derives the next scheduled key using the unified n-step roll configuration."""
+        old_id = self.current_key_id
+        self.key, self.current_key_id, self.previous_key, self.previous_key_id = self._derive_next_key(
+            self.key, old_id, n=1
+        )
+        self.last_roll_time = time.time()
+        self._stream_log("KEY_ROLL", f"Key rolled locally from ID {old_id} to {self.current_key_id}")
+
+    def _check_and_apply_time_roll(self):
+        """Rolls keys automatically if 1 hour (3600 seconds) has elapsed."""
+        if time.time() - self.last_roll_time >= 3600:
+            self._roll_key_local()
+
+    # ──────────────────────────────────────
+    # Logging
+    # ──────────────────────────────────────
+
+    def _stream_log(self, category, message):
+        """Builds and appends telemetry logs as a single-line JSON locally."""
+        try:
+            total_red = self.red_sent_cnt + self.red_drop_cnt
+            red_drop_pct = (self.red_drop_cnt / total_red * 100) if total_red > 0 else 0.0
+
+            total_black = self.black_sent_cnt + self.black_drop_cnt
+            black_drop_pct = (self.black_drop_cnt / total_black * 100) if total_black > 0 else 0.0
+
+            matzpin_type = "SERVER" if self.is_server else "HOST"
+
+            log_payload = {
+                "log_type": matzpin_type,
+                "category": category,
+                "total_transferred_bytes": self.bytes_counter,
+                "red": {
+                    "sent": self.red_sent_cnt,
+                    "drop": self.red_drop_cnt,
+                    "drop_percentage": round(red_drop_pct, 1),
+                    "ddos_alert": (red_drop_pct > 30.0 and total_red > 10),
+                    "port": self.red_nic,
+                    "ip": self.red_ip
+                },
+                "black": {
+                    "sent": self.black_sent_cnt,
+                    "drop": self.black_drop_cnt,
+                    "drop_percentage": round(black_drop_pct, 1),
+                    "ddos_alert": (black_drop_pct > 30.0 and total_black > 10),
+                    "port": self.black_port,
+                    "ip": self.black_ip
+                },
+                "log": message
+            }
+
+            log_line = json.dumps(log_payload)
+            with open(self.log_file_path, "a", encoding="utf-8") as f:
+                f.write(log_line + "\n")
+        except Exception:
+            pass
+
+    # ──────────────────────────────────────
+    # NIC helpers
     # ──────────────────────────────────────
 
     @staticmethod
@@ -139,58 +232,50 @@ class Encryptor:
     # ──────────────────────────────────────
 
     def connect(self):
-        """Establishes the connection based on the mode."""
         if self.is_server:
             self._setup_receiver()
         else:
             self._setup_sender()
 
     def _setup_receiver(self):
-        # Create a TCP/IP socket
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Allow immediate reuse of the port to prevent "Address already in use" errors
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
         self.server_socket.bind((self.black_ip, self.black_port))
         self.server_socket.listen(1)
-        print(f"[Receiver] Listening on {self.black_ip}:{self.black_port}...")
-
-        # Block and wait for incoming connection
         self.black_connection, address = self.server_socket.accept()
-        print(f"[Receiver] Connection established with {address}")
+        self._stream_log("NEW_MATZPIN", f"New TCP receiver")
 
     def _setup_sender(self):
-        # Create a TCP/IP socket
         self.black_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        print(f"[Sender] Connecting to {self.black_ip}:{self.black_port}...")
-
-        # Attempt to connect to the receiver
         self.black_connection.connect((self.black_ip, self.black_port))
-        print("[Sender] Connected successfully.")
+        self._stream_log("NEW_MATZPIN", f"New TCP sender")
 
     def sync_keys(self):
-        private_key = secrets.randbits(256)
+        self._stream_log("KEY_SYNC", f"Starting Diffie-Hellman Key Exchange.")
 
-        # pow(base, exponent, modulus)* 
+        private_key = secrets.randbits(256)
         public_key = pow(DH_BASE, private_key, DH_PRIME)
         pub_bytes = public_key.to_bytes(256, byteorder="big")
-        
+
         if self.is_server:
             self.black_connection.sendall(pub_bytes)
             peer_pub_bytes = encryptor_utils.receive_exact_bytes(self.black_connection, 256)
         else:
             peer_pub_bytes = encryptor_utils.receive_exact_bytes(self.black_connection, 256)
             self.black_connection.sendall(pub_bytes)
-            
+
         peer_public_key = int.from_bytes(peer_pub_bytes, byteorder="big")
-        
-        # calculate the shared secret (g^ab mod p)
         shared_secret = pow(peer_public_key, private_key, DH_PRIME)
-        
         shared_secret_bytes = shared_secret.to_bytes(256, byteorder="big")
 
-        # using sha256 to create a equalized key for encryption
+        # Load clean DH handshake context
         self.key = hashlib.sha256(shared_secret_bytes).digest()
+        self.current_key_id = 0
+        self.previous_key = None
+        self.previous_key_id = None
+        self.last_roll_time = time.time()
+
+        self._stream_log("KEY_SYNC", f"Key exchange successful. Shared initial Key ID 0 loaded.")
 
     # ──────────────────────────────────────
     # ARP handling on the red side
@@ -200,7 +285,8 @@ class Encryptor:
         """Process an ARP frame received on the red side.
 
         * Always learns the sender's MAC.
-        * If it is an ARP request for *our* red IP (or we are the host acting as a proxy), sends a reply.
+        * Server: replies for its own red_ip and the host's NAT external IP.
+        * Host: proxy-ARPs for any IP (so all traffic is routed through it).
 
         Returns an ARP reply frame (bytes) to transmit, or None.
         """
@@ -216,17 +302,21 @@ class Encryptor:
         # Learn the sender
         self.arp_table.update(arp['sender_ip'], arp['sender_mac'])
 
-        # Reply if it's asking for our IP, OR if we are the host (Proxy ARP for everything else)
         if arp['opcode'] == ARP_REQUEST:
-            # Don't reply if it's gratuitous ARP for its own IP
+            self._stream_log("ARP", f"{arp['sender_ip']} is asking: Who has {arp['target_ip']}?")
+        elif arp['opcode'] == ARP_REPLY:
+            self._stream_log("ARP", f"Learned {arp['sender_ip']} -> {arp['sender_mac'].hex(':')}")
+
+        if arp['opcode'] == ARP_REQUEST:
+            # Don't reply to gratuitous ARP
             if arp['target_ip'] == arp['sender_ip']:
                 return None
-                
+
             if arp['target_ip'] in self.arp_respond_ips or not self.is_server:
-                reply = build_arp_reply(
-                    self.red_mac, arp['target_ip'], # Claim to be the requested IP
+                self._stream_log("ARP", f"Replying: {arp['target_ip']} is-at {self.red_mac.hex(':')}")
+                return build_arp_reply(
+                    self.red_mac, arp['target_ip'],
                     arp['sender_mac'], arp['sender_ip'])
-                return reply
 
         return None
 
@@ -251,6 +341,7 @@ class Encryptor:
         # Send an ARP who-has for the target (or gateway)
         arp_req = build_arp_request(self.red_mac, self.red_ip, resolve_ip)
         self.red_socket.send(arp_req)
+        self._stream_log("ARP", f"Sent who-has for {resolve_ip}")
 
         return BROADCAST_MAC  # fallback until we learn the real MAC
 
@@ -261,149 +352,217 @@ class Encryptor:
     def red_to_black_loop(self):
         """
         Red → Black direction.
-        
+
         1. Receive an Ethernet frame from the red NIC
         2. Handle ARP (respond locally, never tunnel ARP)
         3. Strip the Ethernet header to get clean IP bytes
         4. Host only: apply outbound NAT
-        5. Send the IP bytes over the encrypted tunnel
+        5. Encrypt and send the IP bytes over the tunnel
         """
         while self.active:
-            packet_data, _address = self.red_socket.recvfrom(65535)
+            try:
+                packet_data, _address = self.red_socket.recvfrom(65535)
 
-            # --- Parse Ethernet header ---
-            parsed = parse_ethernet_header(packet_data)
-            if parsed is None:
-                continue
-            dst_mac, src_mac, ethertype, ip_bytes = parsed
-
-
-            # Ignore frames that we sent ourselves (loopback)
-            if src_mac == self.red_mac:
-                continue
-
-            # --- ARP: handle locally, never tunnel ---
-            if ethertype == ARP_ETHERTYPE:
-                reply = self._handle_arp(packet_data)
-                if reply:
-                    self.red_socket.send(reply)
-                continue
-
-            # Only forward IPv4
-            if ethertype != IPV4_ETHERTYPE:
-                continue
-
-            if len(ip_bytes) >= 20:
-                src_ip = socket.inet_ntoa(ip_bytes[12:16])
-                self.arp_table.update(src_ip, src_mac)
-            
-
-
-            # --- Host: outbound NAT on the clean IP bytes ---
-            if not self.is_server:
-                ip_bytes = nat.nat_outbound(ip_bytes)
-                if ip_bytes is None:
+                parsed = parse_ethernet_header(packet_data)
+                if parsed is None:
                     continue
-            # 1. Encrypt using AES-CBC (requires padding + dynamic 16-byte IV)
-            iv = os.urandom(16)
-            cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
-            padded_data = pad(ip_bytes, AES.block_size)
-            ciphertext = cipher.encrypt(padded_data)
+                dst_mac, src_mac, ethertype, ip_bytes = parsed
 
-            # 2. Assemble into the "Message Data" array block (IV + Ciphertext)
-            encrypted_message_data = iv + ciphertext
+                # Ignore frames that we sent ourselves (loopback)
+                if src_mac == self.red_mac:
+                    continue
 
-            # 3. Generate verification token: hash(key + message_data) -> exactly 8 bytes
-            verify_input = self.key + encrypted_message_data
-            verify_hash = hashlib.sha256(verify_input).digest()[:8]
+                # ARP: handle locally, never tunnel
+                if ethertype == ARP_ETHERTYPE:
+                    reply = self._handle_arp(packet_data)
+                    if reply:
+                        self.red_socket.send(reply)
+                    continue
 
-            # 4. Build Full Protocol Payload
-            # The length header must represent ONLY the upcoming payload body size
-            payload_body = verify_hash + encrypted_message_data
-            total_payload_length = len(payload_body)
-            
-            header_length_bytes = total_payload_length.to_bytes(4, byteorder="big")
-            
-            # Final Wire Combination Assembly: [4B Length] + [8B Hash] + [IV + Ciphertext]
-            wire_packet = header_length_bytes + payload_body
+                # Only forward IPv4
+                if ethertype != IPV4_ETHERTYPE:
+                    continue
 
-            self.black_connection.sendall(wire_packet)
+                # Learn the source MAC from this frame
+                if len(ip_bytes) >= 20:
+                    src_ip = socket.inet_ntoa(ip_bytes[12:16])
+                    self.arp_table.update(src_ip, src_mac)
+
+                # Host: outbound NAT on the clean IP bytes
+                if not self.is_server:
+                    ip_bytes = nat.nat_outbound(ip_bytes)
+                    if ip_bytes is None:
+                        self.red_drop_cnt += 1
+                        continue
+
+                # Check for hourly timer trigger before encoding outbound wires
+                self._check_and_apply_time_roll()
+
+                self.sequence_counter += 1
+                if self.sequence_counter > (1 << 64) - 1:
+                    raise RuntimeError("Sequence counter overflow! Crypto context exhausted.")
+
+                counter_bytes = struct.pack(">Q", self.sequence_counter)
+                key_id_byte = struct.pack(">B", self.current_key_id)
+
+                iv = os.urandom(16)
+                cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
+                padded_data = pad(ip_bytes, AES.block_size)
+                ciphertext = cipher.encrypt(padded_data)
+
+                encrypted_message_data = iv + ciphertext
+
+                # Compute integrity hash: hash(key + key_id + counter + ciphertext)
+                verify_input = self.key + key_id_byte + counter_bytes + encrypted_message_data
+                verify_hash = hashlib.sha256(verify_input).digest()[:8]
+
+                payload_body = verify_hash + key_id_byte + counter_bytes + encrypted_message_data
+                header_length_bytes = len(payload_body).to_bytes(4, byteorder="big")
+                wire_packet = header_length_bytes + payload_body
+
+                self.black_connection.sendall(wire_packet)
+
+                self.red_sent_cnt += 1
+                self.bytes_counter += len(wire_packet)
+                self._stream_log("MGMT", f"Successfully delivered packet from red to black. ({len(wire_packet)} encrypted bytes).")
+
+            except RuntimeError:
+                raise
+            except Exception as e:
+                self.red_drop_cnt += 1
+                self._stream_log("PACKET_DROP", f"RED line: Exception while handling package encryption: {str(e)}.")
 
     def black_to_red_loop(self):
         """
         Black → Red direction.
 
-        1. Receive IP bytes from the encrypted tunnel
-        2. Host only: apply inbound NAT
-        3. Resolve the destination MAC via ARP cache
-        4. Build a new Ethernet frame (our MAC as source)
-        5. Inject the frame onto the red NIC
+        1. Receive encrypted payload from the tunnel
+        2. Anti-replay check
+        3. Key selection (current, previous, or catch-up)
+        4. Verify HMAC, then decrypt
+        5. Host only: apply inbound NAT
+        6. Resolve destination MAC and inject Ethernet frame onto the red NIC
         """
         while self.active:
             try:
                 payload_received = encryptor_utils.receive_tcp_message(self.black_connection)
                 if payload_received is None:
-                    print("Received None. Connection likely dropped or invalid data.")
-                    self.active = False
-
-                
-
-                if payload_received is None:
-                    print("[Black-to-Red] Error: Connection dropped or empty message.")
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", "BLACK line: Invalid TCP message length")
                     continue
 
-                # 2. Check protocol length boundaries (8 bytes verification + 16 bytes IV + at least 16 bytes ciphertext block)
-                if len(payload_received) < 40:
-                    print(f"[ALERT] Protocol violation! Packet too small ({len(payload_received)} bytes). Dropping.")
+                if len(payload_received) < 49:
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", f"BLACK line: Packet size header too small ({len(payload_received)} bytes).")
                     continue
 
-                # 3. Parse fields directly from the payload payload
+                # --- Slice Fields ---
                 provided_verify_hash = payload_received[0:8]
-                message_data = payload_received[8:]
+                key_id_byte          = payload_received[8:9]
+                counter_bytes        = payload_received[9:17]
+                message_data         = payload_received[17:]
 
-                # 4. Validate Custom Hash Verification: hash(key + message_data) using first 8 bytes
-                verify_input = self.key + message_data
-                calculated_hash = hashlib.sha256(verify_input).digest()[:8]
-                
-                if calculated_hash != provided_verify_hash:
-                    print("[ALERT] Verification Failed! Signature bad. Dropping.")
+                remote_key_id = struct.unpack(">B", key_id_byte)[0]
+                seq_num = struct.unpack(">Q", counter_bytes)[0]
+
+                # --- Sliding Window Pre-Check ---
+                if seq_num <= self.replay_window.max_seen - self.replay_window.window_size:
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", f"BLACK line: REPLAY dropped: outside window tail.")
                     continue
 
-                # 5. Separate IV and Ciphertext out of the remaining message data block
+                if seq_num <= self.replay_window.max_seen:
+                    bit_position = self.replay_window.max_seen - seq_num
+                    if (self.replay_window.bitmap & (1 << bit_position)) != 0:
+                        self.black_drop_cnt += 1
+                        self._stream_log("PACKET_DROP", f"BLACK line: REPLAY dropped: Duplicate.")
+                        continue
+
+                # --- Speculative Key Selection / Calculation ---
+                target_decryption_key = None
+                speculative_previous_key = None
+                speculative_previous_key_id = None
+
+                if remote_key_id == self.current_key_id:
+                    target_decryption_key = self.key
+                elif remote_key_id == self.previous_key_id and self.previous_key is not None:
+                    target_decryption_key = self.previous_key
+                else:
+                    distance = (remote_key_id - self.current_key_id) % 256
+                    if 0 < distance <= 128:
+                        target_decryption_key, _, speculative_previous_key, speculative_previous_key_id = (
+                            self._derive_next_key(self.key, self.current_key_id, n=distance)
+                        )
+                    else:
+                        self.black_drop_cnt += 1
+                        self._stream_log("PACKET_DROP", f"BLACK line: Unresolvable distant Key ID: {remote_key_id}")
+                        continue
+
+                # --- Validate Hash Integrity ---
+                verify_input = target_decryption_key + key_id_byte + counter_bytes + message_data
+                calculated_hash = hashlib.sha256(verify_input).digest()[:8]
+
+                if calculated_hash != provided_verify_hash:
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", f"BLACK line: Verification failed for Key ID {remote_key_id}.")
+                    continue
+
+                # --- Cryptographic Proof Obtained: Commit State Variables ---
+                if remote_key_id != self.current_key_id and remote_key_id != self.previous_key_id:
+                    self.key = target_decryption_key
+                    self.previous_key = speculative_previous_key
+                    self.previous_key_id = speculative_previous_key_id
+                    self.current_key_id = remote_key_id
+                    self.last_roll_time = time.time()
+                    self._stream_log("KEY_ROLL", f"Caught up to peer verified Key ID: {remote_key_id}")
+
+                # Commit sequence number to sliding anti-replay tracking window
+                self.replay_window.verify_and_update(seq_num)
+
+                # --- Decrypt ---
                 iv = message_data[:16]
                 ciphertext = message_data[16:]
 
-                # 6. Decrypt using AES-CBC
-                cipher = AES.new(self.key, AES.MODE_CBC, iv=iv)
+                cipher = AES.new(target_decryption_key, AES.MODE_CBC, iv=iv)
                 encrypted_padded = cipher.decrypt(ciphertext)
-                
-                # Strip PKCS7 padding securely
                 ip_bytes = unpad(encrypted_padded, AES.block_size)
-                if len(ip_bytes) > 2500:
-                    print("IP payload exceeds MTU, dropping")
+
+                if len(ip_bytes) > 1500:
+                    self.black_drop_cnt += 1
+                    self._stream_log("PACKET_DROP", "BLACK line: Decrypted IP payload exceeds MTU.")
                     continue
 
-                # --- Host: inbound NAT ---
+                # Host: inbound NAT
                 if not self.is_server:
                     ip_bytes = nat.nat_inbound(ip_bytes)
                     if ip_bytes is None:
+                        self.black_drop_cnt += 1
+                        self._stream_log("PACKET_DROP", "BLACK line: Inbound NAT translation failed.")
                         continue
 
-                # --- Resolve destination MAC ---
+                # --- Resolve destination MAC and inject onto the red NIC ---
                 if len(ip_bytes) >= 20:
                     dst_ip = socket.inet_ntoa(ip_bytes[16:20])
                     dst_mac = self._resolve_mac(dst_ip)
                 else:
                     dst_mac = BROADCAST_MAC
 
-
-
-            # --- Rebuild Ethernet frame and inject onto the red NIC ---
-                to_send_packet = build_ethernet_frame(
+                final_ethernet_frame = build_ethernet_frame(
                     dst_mac, self.red_mac, IPV4_ETHERTYPE, ip_bytes)
-                self.red_socket.send(to_send_packet)
+
+                if final_ethernet_frame is None:
+                    self.black_drop_cnt += 1
+                    continue
+
+                self.red_socket.send(final_ethernet_frame)
+
+                self.black_sent_cnt += 1
+                self.bytes_counter += len(final_ethernet_frame)
+                self._stream_log("MGMT", f"Successfully delivered packet from black to red. ({len(final_ethernet_frame)} frame bytes).")
 
             except ValueError:
-                print("[ALERT] Decryption Error: Padding is corrupted or wrong key used.")
+                self.black_drop_cnt += 1
+                self._stream_log("ALERT", "BLACK line: Decryption Error: Padding is corrupted or wrong key used.")
             except Exception as e:
-                print(f"[Black-to-Red] Unexpected Loop Error: {e}")
+                self.black_drop_cnt += 1
+                self._stream_log("ALERT", f"BLACK line: Exception while handling package decryption: {str(e)}.")
